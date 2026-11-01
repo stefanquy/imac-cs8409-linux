@@ -1,0 +1,21 @@
+--- a/common/hda_local.h
++++ b/common/hda_local.h
+@@ -3,6 +3,10 @@
+  * Universal Interface for Intel High Definition Audio Codec
+  *
+  * Local helper functions
++ *
++ * Local project modification, 2026-11-01: add share_spdif_kctl to
++ * hda_multi_out to match the running Ubuntu kernel BTF layout.
++ * See docs/PROVENANCE.md and patches/0001-local-abi-and-notice.patch.
+  *
+  * Copyright (c) 2004 Takashi Iwai <tiwai@suse.de>
+  */
+@@ -221,6 +225,7 @@
+ 	unsigned int spdif_rates;
+ 	unsigned int spdif_maxbps;
+ 	u64 spdif_formats;
++	struct snd_kcontrol *share_spdif_kctl;
+ };
+ 
+ int snd_hda_create_spdif_share_sw(struct hda_codec *codec,

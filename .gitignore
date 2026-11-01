@@ -1,0 +1,26 @@
+# Kernel/DKMS build output
+*.o
+*.ko
+*.ko.*
+*.mod
+*.mod.c
+*.cmd
+Module.symvers
+modules.order
+.tmp_versions/
+.cache.mk
+__pycache__/
+*.py[cod]
+*.bak
+*~
+# Signing and local credentials: never add these, even with git add -f.
+*.key
+*.pem
+*.p12
+*.pfx
+*.der
+*.crt
+.env
+.env.*
+id_rsa*
+id_ed25519*

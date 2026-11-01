@@ -1,0 +1,2387 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * HD audio codec driver for Cirrus Logic CS8409 HDA bridge chip
+ *
+ * Copyright (C) 2021 Cirrus Logic, Inc. and
+ *                    Cirrus Logic International Semiconductor Ltd.
+ */
+
+#include <linux/acpi.h>
+#include <linux/cleanup.h>
+#include <linux/i2c.h>
+#include <linux/init.h>
+#include <linux/slab.h>
+#include <linux/module.h>
+#include <linux/spi/spi.h>
+#include <sound/core.h>
+#include <linux/mutex.h>
+#include <linux/iopoll.h>
+
+#include "cs8409.h"
+#include "../side-codecs/hda_component.h"
+
+/******************************************************************************
+ *                        CS8409 Specific Functions
+ ******************************************************************************/
+
+static int cs8409_parse_auto_config(struct hda_codec *codec)
+{
+	struct cs8409_spec *spec = codec->spec;
+	int err;
+	int i;
+
+	err = snd_hda_parse_pin_defcfg(codec, &spec->gen.autocfg, NULL, 0);
+	if (err < 0)
+		return err;
+
+	err = snd_hda_gen_parse_auto_config(codec, &spec->gen.autocfg);
+	if (err < 0)
+		return err;
+
+	/* keep the ADCs powered up when it's dynamically switchable */
+	if (spec->gen.dyn_adc_switch) {
+		unsigned int done = 0;
+
+		for (i = 0; i < spec->gen.input_mux.num_items; i++) {
+			int idx = spec->gen.dyn_adc_idx[i];
+
+			if (done & (1 << idx))
+				continue;
+			snd_hda_gen_fix_pin_power(codec, spec->gen.adc_nids[idx]);
+			done |= 1 << idx;
+		}
+	}
+
+	return 0;
+}
+
+static void cs8409_disable_i2c_clock_worker(struct work_struct *work);
+static void cs8409_cs42l83_jack_poll_work(struct work_struct *work);
+static void cs8409_cs42l83_headset_bias(struct hda_codec *codec, bool on);
+static void cs8409_cs42l83_headset_mic_enable(struct hda_codec *codec);
+static void cs8409_cs42l83_headset_mic_disable(struct hda_codec *codec);
+
+static struct cs8409_spec *cs8409_alloc_spec(struct hda_codec *codec)
+{
+	struct cs8409_spec *spec;
+
+	spec = kzalloc_obj(*spec);
+	if (!spec)
+		return NULL;
+	codec->spec = spec;
+	spec->codec = codec;
+	codec->power_save_node = 1;
+	mutex_init(&spec->i2c_mux);
+	INIT_DELAYED_WORK(&spec->i2c_clk_work, cs8409_disable_i2c_clock_worker);
+	INIT_DELAYED_WORK(&spec->jack_poll_work, cs8409_cs42l83_jack_poll_work);
+	spec->jack_poll_last_det = -1;
+	snd_hda_gen_spec_init(&spec->gen);
+
+	return spec;
+}
+
+static inline int cs8409_vendor_coef_get(struct hda_codec *codec, unsigned int idx)
+{
+	snd_hda_codec_write(codec, CS8409_PIN_VENDOR_WIDGET, 0, AC_VERB_SET_COEF_INDEX, idx);
+	return snd_hda_codec_read(codec, CS8409_PIN_VENDOR_WIDGET, 0, AC_VERB_GET_PROC_COEF, 0);
+}
+
+static inline void cs8409_vendor_coef_set(struct hda_codec *codec, unsigned int idx,
+					  unsigned int coef)
+{
+	snd_hda_codec_write(codec, CS8409_PIN_VENDOR_WIDGET, 0, AC_VERB_SET_COEF_INDEX, idx);
+	snd_hda_codec_write(codec, CS8409_PIN_VENDOR_WIDGET, 0, AC_VERB_SET_PROC_COEF, coef);
+}
+
+/*
+ * cs8409_enable_i2c_clock - Disable I2C clocks
+ * @codec: the codec instance
+ * Disable I2C clocks.
+ * This must be called when the i2c mutex is unlocked.
+ */
+static void cs8409_disable_i2c_clock(struct hda_codec *codec)
+{
+	struct cs8409_spec *spec = codec->spec;
+
+	guard(mutex)(&spec->i2c_mux);
+	if (spec->i2c_clck_enabled) {
+		cs8409_vendor_coef_set(spec->codec, 0x0,
+			       cs8409_vendor_coef_get(spec->codec, 0x0) & 0xfffffff7);
+		spec->i2c_clck_enabled = 0;
+	}
+}
+
+/*
+ * cs8409_disable_i2c_clock_worker - Worker that disable the I2C Clock after 25ms without use
+ */
+static void cs8409_disable_i2c_clock_worker(struct work_struct *work)
+{
+	struct cs8409_spec *spec = container_of(work, struct cs8409_spec, i2c_clk_work.work);
+
+	cs8409_disable_i2c_clock(spec->codec);
+}
+
+/*
+ * cs8409_enable_i2c_clock - Enable I2C clocks
+ * @codec: the codec instance
+ * Enable I2C clocks.
+ * This must be called when the i2c mutex is locked.
+ */
+static void cs8409_enable_i2c_clock(struct hda_codec *codec)
+{
+	struct cs8409_spec *spec = codec->spec;
+
+	/* Cancel the disable timer, but do not wait for any running disable functions to finish.
+	 * If the disable timer runs out before cancel, the delayed work thread will be blocked,
+	 * waiting for the mutex to become unlocked. This mutex will be locked for the duration of
+	 * any i2c transaction, so the disable function will run to completion immediately
+	 * afterwards in the scenario. The next enable call will re-enable the clock, regardless.
+	 */
+	cancel_delayed_work(&spec->i2c_clk_work);
+
+	if (!spec->i2c_clck_enabled) {
+		cs8409_vendor_coef_set(codec, 0x0, cs8409_vendor_coef_get(codec, 0x0) | 0x8);
+		spec->i2c_clck_enabled = 1;
+	}
+	queue_delayed_work(system_power_efficient_wq, &spec->i2c_clk_work, msecs_to_jiffies(25));
+}
+
+/**
+ * cs8409_i2c_wait_complete - Wait for I2C transaction
+ * @codec: the codec instance
+ *
+ * Wait for I2C transaction to complete.
+ * Return -ETIMEDOUT if transaction wait times out.
+ */
+static int cs8409_i2c_wait_complete(struct hda_codec *codec)
+{
+	unsigned int retval;
+
+	return read_poll_timeout(cs8409_vendor_coef_get, retval, retval & 0x18,
+		CS42L42_I2C_SLEEP_US, CS42L42_I2C_TIMEOUT_US, false, codec, CS8409_I2C_STS);
+}
+
+/**
+ * cs8409_set_i2c_dev_addr - Set i2c address for transaction
+ * @codec: the codec instance
+ * @addr: I2C Address
+ */
+static void cs8409_set_i2c_dev_addr(struct hda_codec *codec, unsigned int addr)
+{
+	struct cs8409_spec *spec = codec->spec;
+
+	if (spec->dev_addr != addr) {
+		cs8409_vendor_coef_set(codec, CS8409_I2C_ADDR, addr);
+		spec->dev_addr = addr;
+	}
+}
+
+/**
+ * cs8409_i2c_set_page - CS8409 I2C set page register.
+ * @scodec: the codec instance
+ * @i2c_reg: Page register
+ *
+ * Returns negative on error.
+ */
+static int cs8409_i2c_set_page(struct sub_codec *scodec, unsigned int i2c_reg)
+{
+	struct hda_codec *codec = scodec->codec;
+
+	if (scodec->paged && (scodec->last_page != (i2c_reg >> 8))) {
+		cs8409_vendor_coef_set(codec, CS8409_I2C_QWRITE, i2c_reg >> 8);
+		if (cs8409_i2c_wait_complete(codec) < 0)
+			return -EIO;
+		scodec->last_page = i2c_reg >> 8;
+	}
+
+	return 0;
+}
+
+/**
+ * cs8409_i2c_read - CS8409 I2C Read.
+ * @scodec: the codec instance
+ * @addr: Register to read
+ *
+ * Returns negative on error, otherwise returns read value in bits 0-7.
+ */
+static int cs8409_i2c_read(struct sub_codec *scodec, unsigned int addr)
+{
+	struct hda_codec *codec = scodec->codec;
+	struct cs8409_spec *spec = codec->spec;
+	unsigned int i2c_reg_data;
+	unsigned int read_data;
+
+	if (scodec->suspended)
+		return -EPERM;
+
+	guard(mutex)(&spec->i2c_mux);
+	cs8409_enable_i2c_clock(codec);
+	cs8409_set_i2c_dev_addr(codec, scodec->addr);
+
+	if (cs8409_i2c_set_page(scodec, addr))
+		goto error;
+
+	i2c_reg_data = (addr << 8) & 0x0ffff;
+	cs8409_vendor_coef_set(codec, CS8409_I2C_QREAD, i2c_reg_data);
+	if (cs8409_i2c_wait_complete(codec) < 0)
+		goto error;
+
+	/* Register in bits 15-8 and the data in 7-0 */
+	read_data = cs8409_vendor_coef_get(codec, CS8409_I2C_QREAD);
+
+	return read_data & 0x0ff;
+
+error:
+	codec_err(codec, "%s() Failed 0x%02x : 0x%04x\n", __func__, scodec->addr, addr);
+	return -EIO;
+}
+
+/**
+ * cs8409_i2c_bulk_read - CS8409 I2C Read Sequence.
+ * @scodec: the codec instance
+ * @seq: Register Sequence to read
+ * @count: Number of registeres to read
+ *
+ * Returns negative on error, values are read into value element of cs8409_i2c_param sequence.
+ */
+static int cs8409_i2c_bulk_read(struct sub_codec *scodec, struct cs8409_i2c_param *seq, int count)
+{
+	struct hda_codec *codec = scodec->codec;
+	struct cs8409_spec *spec = codec->spec;
+	unsigned int i2c_reg_data;
+	int i;
+
+	if (scodec->suspended)
+		return -EPERM;
+
+	guard(mutex)(&spec->i2c_mux);
+	cs8409_set_i2c_dev_addr(codec, scodec->addr);
+
+	for (i = 0; i < count; i++) {
+		cs8409_enable_i2c_clock(codec);
+		if (cs8409_i2c_set_page(scodec, seq[i].addr))
+			goto error;
+
+		i2c_reg_data = (seq[i].addr << 8) & 0x0ffff;
+		cs8409_vendor_coef_set(codec, CS8409_I2C_QREAD, i2c_reg_data);
+
+		if (cs8409_i2c_wait_complete(codec) < 0)
+			goto error;
+
+		seq[i].value = cs8409_vendor_coef_get(codec, CS8409_I2C_QREAD) & 0xff;
+	}
+
+	return 0;
+
+error:
+	codec_err(codec, "I2C Bulk Write Failed 0x%02x\n", scodec->addr);
+	return -EIO;
+}
+
+/**
+ * cs8409_i2c_write - CS8409 I2C Write.
+ * @scodec: the codec instance
+ * @addr: Register to write to
+ * @value: Data to write
+ *
+ * Returns negative on error, otherwise returns 0.
+ */
+static int cs8409_i2c_write(struct sub_codec *scodec, unsigned int addr, unsigned int value)
+{
+	struct hda_codec *codec = scodec->codec;
+	struct cs8409_spec *spec = codec->spec;
+	unsigned int i2c_reg_data;
+
+	if (scodec->suspended)
+		return -EPERM;
+
+	guard(mutex)(&spec->i2c_mux);
+
+	cs8409_enable_i2c_clock(codec);
+	cs8409_set_i2c_dev_addr(codec, scodec->addr);
+
+	if (cs8409_i2c_set_page(scodec, addr))
+		goto error;
+
+	i2c_reg_data = ((addr << 8) & 0x0ff00) | (value & 0x0ff);
+	cs8409_vendor_coef_set(codec, CS8409_I2C_QWRITE, i2c_reg_data);
+
+	if (cs8409_i2c_wait_complete(codec) < 0)
+		goto error;
+
+	return 0;
+
+error:
+	codec_err(codec, "%s() Failed 0x%02x : 0x%04x\n", __func__, scodec->addr, addr);
+	return -EIO;
+}
+
+/**
+ * cs8409_amp_i2c_write - Write to an unpaged I2C device behind the CS8409
+ * (e.g. the iMac's TAS5764 speaker amps). Unlike cs8409_i2c_write() this is
+ * not tied to a sub_codec and uses an 8-bit register / 8-bit value with no
+ * paging.
+ * @codec: the codec instance
+ * @dev_addr: 8-bit I2C device address (e.g. 0xd8)
+ * @reg: register
+ * @value: data
+ */
+static int cs8409_amp_i2c_write(struct hda_codec *codec, unsigned int dev_addr,
+				unsigned int reg, unsigned int value)
+{
+	struct cs8409_spec *spec = codec->spec;
+	unsigned int i2c_reg_data;
+
+	guard(mutex)(&spec->i2c_mux);
+
+	cs8409_enable_i2c_clock(codec);
+	cs8409_set_i2c_dev_addr(codec, dev_addr);
+
+	i2c_reg_data = ((reg << 8) & 0x0ff00) | (value & 0x0ff);
+	cs8409_vendor_coef_set(codec, CS8409_I2C_QWRITE, i2c_reg_data);
+
+	if (cs8409_i2c_wait_complete(codec) < 0) {
+		codec_err(codec, "amp i2c write failed 0x%02x : 0x%02x\n", dev_addr, reg);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+/**
+ * cs8409_i2c_bulk_write - CS8409 I2C Write Sequence.
+ * @scodec: the codec instance
+ * @seq: Register Sequence to write
+ * @count: Number of registeres to write
+ *
+ * Returns negative on error.
+ */
+static int cs8409_i2c_bulk_write(struct sub_codec *scodec, const struct cs8409_i2c_param *seq,
+				 int count)
+{
+	struct hda_codec *codec = scodec->codec;
+	struct cs8409_spec *spec = codec->spec;
+	unsigned int i2c_reg_data;
+	int i;
+
+	if (scodec->suspended)
+		return -EPERM;
+
+	guard(mutex)(&spec->i2c_mux);
+	cs8409_set_i2c_dev_addr(codec, scodec->addr);
+
+	for (i = 0; i < count; i++) {
+		cs8409_enable_i2c_clock(codec);
+		if (cs8409_i2c_set_page(scodec, seq[i].addr))
+			goto error;
+
+		i2c_reg_data = ((seq[i].addr << 8) & 0x0ff00) | (seq[i].value & 0x0ff);
+		cs8409_vendor_coef_set(codec, CS8409_I2C_QWRITE, i2c_reg_data);
+
+		if (cs8409_i2c_wait_complete(codec) < 0)
+			goto error;
+		/* Certain use cases may require a delay
+		 * after a write operation before proceeding.
+		 */
+		if (seq[i].delay)
+			fsleep(seq[i].delay);
+	}
+
+	return 0;
+
+error:
+	codec_err(codec, "I2C Bulk Write Failed 0x%02x\n", scodec->addr);
+	return -EIO;
+}
+
+static int cs8409_init(struct hda_codec *codec)
+{
+	int ret = snd_hda_gen_init(codec);
+
+	if (!ret)
+		snd_hda_apply_fixup(codec, HDA_FIXUP_ACT_INIT);
+
+	return ret;
+}
+
+static int cs8409_build_controls(struct hda_codec *codec)
+{
+	int err;
+
+	err = snd_hda_gen_build_controls(codec);
+	if (err < 0)
+		return err;
+	snd_hda_apply_fixup(codec, HDA_FIXUP_ACT_BUILD);
+
+	return 0;
+}
+
+/* Enable/Disable Unsolicited Response */
+static void cs8409_enable_ur(struct hda_codec *codec, int flag)
+{
+	struct cs8409_spec *spec = codec->spec;
+	unsigned int ur_gpios = 0;
+	int i;
+
+	for (i = 0; i < spec->num_scodecs; i++)
+		ur_gpios |= spec->scodecs[i]->irq_mask;
+
+	snd_hda_codec_write(codec, CS8409_PIN_AFG, 0, AC_VERB_SET_GPIO_UNSOLICITED_RSP_MASK,
+			    flag ? ur_gpios : 0);
+
+	snd_hda_codec_write(codec, CS8409_PIN_AFG, 0, AC_VERB_SET_UNSOLICITED_ENABLE,
+			    flag ? AC_UNSOL_ENABLED : 0);
+}
+
+static void cs8409_fix_caps(struct hda_codec *codec, unsigned int nid)
+{
+	int caps;
+
+	/* CS8409 is simple HDA bridge and intended to be used with a remote
+	 * companion codec. Most of input/output PIN(s) have only basic
+	 * capabilities. Receive and Transmit NID(s) have only OUTC and INC
+	 * capabilities and no presence detect capable (PDC) and call to
+	 * snd_hda_gen_build_controls() will mark them as non detectable
+	 * phantom jacks. However, a companion codec may be
+	 * connected to these pins which supports jack detect
+	 * capabilities. We have to override pin capabilities,
+	 * otherwise they will not be created as input devices.
+	 */
+	caps = snd_hdac_read_parm(&codec->core, nid, AC_PAR_PIN_CAP);
+	if (caps >= 0)
+		snd_hdac_override_parm(&codec->core, nid, AC_PAR_PIN_CAP,
+				       (caps | (AC_PINCAP_IMP_SENSE | AC_PINCAP_PRES_DETECT)));
+
+	snd_hda_override_wcaps(codec, nid, (get_wcaps(codec, nid) | AC_WCAP_UNSOL_CAP));
+}
+
+static int cs8409_spk_sw_gpio_get(struct snd_kcontrol *kcontrol,
+				 struct snd_ctl_elem_value *ucontrol)
+{
+	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+	struct cs8409_spec *spec = codec->spec;
+
+	ucontrol->value.integer.value[0] = !!(spec->gpio_data & spec->speaker_pdn_gpio);
+	return 0;
+}
+
+static int cs8409_spk_sw_gpio_put(struct snd_kcontrol *kcontrol,
+				 struct snd_ctl_elem_value *ucontrol)
+{
+	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+	struct cs8409_spec *spec = codec->spec;
+	unsigned int gpio_data;
+
+	gpio_data = (spec->gpio_data & ~spec->speaker_pdn_gpio) |
+		(ucontrol->value.integer.value[0] ? spec->speaker_pdn_gpio : 0);
+	if (gpio_data == spec->gpio_data)
+		return 0;
+	spec->gpio_data = gpio_data;
+	snd_hda_codec_write(codec, CS8409_PIN_AFG, 0, AC_VERB_SET_GPIO_DATA, spec->gpio_data);
+	return 1;
+}
+
+static const struct snd_kcontrol_new cs8409_spk_sw_ctrl = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.info = snd_ctl_boolean_mono_info,
+	.get = cs8409_spk_sw_gpio_get,
+	.put = cs8409_spk_sw_gpio_put,
+};
+
+/******************************************************************************
+ *                        CS42L42 Specific Functions
+ ******************************************************************************/
+
+int cs42l42_volume_info(struct snd_kcontrol *kctrl, struct snd_ctl_elem_info *uinfo)
+{
+	unsigned int ofs = get_amp_offset(kctrl);
+	u8 chs = get_amp_channels(kctrl);
+
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	uinfo->value.integer.step = 1;
+	uinfo->count = chs == 3 ? 2 : 1;
+
+	switch (ofs) {
+	case CS42L42_VOL_DAC:
+		uinfo->value.integer.min = CS42L42_HP_VOL_REAL_MIN;
+		uinfo->value.integer.max = CS42L42_HP_VOL_REAL_MAX;
+		break;
+	case CS42L42_VOL_ADC:
+		uinfo->value.integer.min = CS42L42_AMIC_VOL_REAL_MIN;
+		uinfo->value.integer.max = CS42L42_AMIC_VOL_REAL_MAX;
+		break;
+	default:
+		break;
+	}
+
+	return 0;
+}
+
+int cs42l42_volume_get(struct snd_kcontrol *kctrl, struct snd_ctl_elem_value *uctrl)
+{
+	struct hda_codec *codec = snd_kcontrol_chip(kctrl);
+	struct cs8409_spec *spec = codec->spec;
+	struct sub_codec *cs42l42 = spec->scodecs[get_amp_index(kctrl)];
+	int chs = get_amp_channels(kctrl);
+	unsigned int ofs = get_amp_offset(kctrl);
+	long *valp = uctrl->value.integer.value;
+
+	switch (ofs) {
+	case CS42L42_VOL_DAC:
+		if (chs & BIT(0))
+			*valp++ = cs42l42->vol[ofs];
+		if (chs & BIT(1))
+			*valp = cs42l42->vol[ofs+1];
+		break;
+	case CS42L42_VOL_ADC:
+		if (chs & BIT(0))
+			*valp = cs42l42->vol[ofs];
+		break;
+	default:
+		break;
+	}
+
+	return 0;
+}
+
+static void cs42l42_mute(struct sub_codec *cs42l42, int vol_type,
+	unsigned int chs, bool mute)
+{
+	if (mute) {
+		if (vol_type == CS42L42_VOL_DAC) {
+			if (chs & BIT(0))
+				cs8409_i2c_write(cs42l42, CS42L42_MIXER_CHA_VOL, 0x3f);
+			if (chs & BIT(1))
+				cs8409_i2c_write(cs42l42, CS42L42_MIXER_CHB_VOL, 0x3f);
+		} else if (vol_type == CS42L42_VOL_ADC) {
+			if (chs & BIT(0))
+				cs8409_i2c_write(cs42l42, CS42L42_ADC_VOLUME, 0x9f);
+		}
+	} else {
+		if (vol_type == CS42L42_VOL_DAC) {
+			if (chs & BIT(0))
+				cs8409_i2c_write(cs42l42, CS42L42_MIXER_CHA_VOL,
+					-(cs42l42->vol[CS42L42_DAC_CH0_VOL_OFFSET])
+					& CS42L42_MIXER_CH_VOL_MASK);
+			if (chs & BIT(1))
+				cs8409_i2c_write(cs42l42, CS42L42_MIXER_CHB_VOL,
+					-(cs42l42->vol[CS42L42_DAC_CH1_VOL_OFFSET])
+					& CS42L42_MIXER_CH_VOL_MASK);
+		} else if (vol_type == CS42L42_VOL_ADC) {
+			if (chs & BIT(0))
+				cs8409_i2c_write(cs42l42, CS42L42_ADC_VOLUME,
+					cs42l42->vol[CS42L42_ADC_VOL_OFFSET]
+					& CS42L42_REG_AMIC_VOL_MASK);
+		}
+	}
+}
+
+int cs42l42_volume_put(struct snd_kcontrol *kctrl, struct snd_ctl_elem_value *uctrl)
+{
+	struct hda_codec *codec = snd_kcontrol_chip(kctrl);
+	struct cs8409_spec *spec = codec->spec;
+	struct sub_codec *cs42l42 = spec->scodecs[get_amp_index(kctrl)];
+	int chs = get_amp_channels(kctrl);
+	unsigned int ofs = get_amp_offset(kctrl);
+	long *valp = uctrl->value.integer.value;
+
+	switch (ofs) {
+	case CS42L42_VOL_DAC:
+		if (chs & BIT(0))
+			cs42l42->vol[ofs] = *valp;
+		if (chs & BIT(1)) {
+			valp++;
+			cs42l42->vol[ofs + 1] = *valp;
+		}
+		if (spec->playback_started)
+			cs42l42_mute(cs42l42, CS42L42_VOL_DAC, chs, false);
+		break;
+	case CS42L42_VOL_ADC:
+		if (chs & BIT(0))
+			cs42l42->vol[ofs] = *valp;
+		if (spec->capture_started)
+			cs42l42_mute(cs42l42, CS42L42_VOL_ADC, chs, false);
+		break;
+	default:
+		break;
+	}
+
+	return 0;
+}
+
+static void cs42l42_playback_pcm_hook(struct hda_pcm_stream *hinfo,
+				   struct hda_codec *codec,
+				   struct snd_pcm_substream *substream,
+				   int action)
+{
+	struct cs8409_spec *spec = codec->spec;
+	struct sub_codec *cs42l42;
+	int i;
+	bool mute;
+
+	switch (action) {
+	case HDA_GEN_PCM_ACT_PREPARE:
+		mute = false;
+		spec->playback_started = 1;
+		break;
+	case HDA_GEN_PCM_ACT_CLEANUP:
+		mute = true;
+		spec->playback_started = 0;
+		break;
+	default:
+		return;
+	}
+
+	for (i = 0; i < spec->num_scodecs; i++) {
+		cs42l42 = spec->scodecs[i];
+		cs42l42_mute(cs42l42, CS42L42_VOL_DAC, 0x3, mute);
+	}
+}
+
+static void cs42l42_capture_pcm_hook(struct hda_pcm_stream *hinfo,
+				   struct hda_codec *codec,
+				   struct snd_pcm_substream *substream,
+				   int action)
+{
+	struct cs8409_spec *spec = codec->spec;
+	struct sub_codec *cs42l42;
+	int i;
+	bool mute;
+
+	switch (action) {
+	case HDA_GEN_PCM_ACT_PREPARE:
+		mute = false;
+		spec->capture_started = 1;
+		break;
+	case HDA_GEN_PCM_ACT_CLEANUP:
+		mute = true;
+		spec->capture_started = 0;
+		break;
+	default:
+		return;
+	}
+
+	for (i = 0; i < spec->num_scodecs; i++) {
+		cs42l42 = spec->scodecs[i];
+		cs42l42_mute(cs42l42, CS42L42_VOL_ADC, 0x3, mute);
+	}
+}
+
+/* Configure CS42L42 slave codec for jack autodetect */
+static void cs42l42_enable_jack_detect(struct sub_codec *cs42l42)
+{
+	cs8409_i2c_write(cs42l42, CS42L42_HSBIAS_SC_AUTOCTL, cs42l42->hsbias_hiz);
+	/* Clear WAKE# */
+	cs8409_i2c_write(cs42l42, CS42L42_WAKE_CTL, 0x00C1);
+	/* Wait ~2.5ms */
+	usleep_range(2500, 3000);
+	/* Set mode WAKE# output follows the combination logic directly */
+	cs8409_i2c_write(cs42l42, CS42L42_WAKE_CTL, 0x00C0);
+	/* Clear interrupts status */
+	cs8409_i2c_read(cs42l42, CS42L42_TSRS_PLUG_STATUS);
+	/* Enable interrupt */
+	cs8409_i2c_write(cs42l42, CS42L42_TSRS_PLUG_INT_MASK, 0xF3);
+}
+
+/* Enable and run CS42L42 slave codec jack auto detect */
+static void cs42l42_run_jack_detect(struct sub_codec *cs42l42)
+{
+	/* Clear interrupts */
+	cs8409_i2c_read(cs42l42, CS42L42_CODEC_STATUS);
+	cs8409_i2c_read(cs42l42, CS42L42_DET_STATUS1);
+	cs8409_i2c_write(cs42l42, CS42L42_TSRS_PLUG_INT_MASK, 0xFF);
+	cs8409_i2c_read(cs42l42, CS42L42_TSRS_PLUG_STATUS);
+
+	cs8409_i2c_write(cs42l42, CS42L42_PWR_CTL2, 0x87);
+	cs8409_i2c_write(cs42l42, CS42L42_DAC_CTL2, 0x86);
+	cs8409_i2c_write(cs42l42, CS42L42_MISC_DET_CTL, 0x07);
+	cs8409_i2c_write(cs42l42, CS42L42_CODEC_INT_MASK, 0xFD);
+	cs8409_i2c_write(cs42l42, CS42L42_HSDET_CTL2, 0x80);
+	/* Wait ~20ms*/
+	usleep_range(20000, 25000);
+	cs8409_i2c_write(cs42l42, CS42L42_HSDET_CTL1, 0x77);
+	cs8409_i2c_write(cs42l42, CS42L42_HSDET_CTL2, 0xc0);
+}
+
+static int cs42l42_manual_hs_det(struct sub_codec *cs42l42)
+{
+	unsigned int hs_det_status;
+	unsigned int hs_det_comp1;
+	unsigned int hs_det_comp2;
+	unsigned int hs_det_sw;
+	unsigned int hs_type;
+
+	/* Set hs detect to manual, active mode */
+	cs8409_i2c_write(cs42l42, CS42L42_HSDET_CTL2,
+			 (1 << CS42L42_HSDET_CTRL_SHIFT) |
+			 (0 << CS42L42_HSDET_SET_SHIFT) |
+			 (0 << CS42L42_HSBIAS_REF_SHIFT) |
+			 (0 << CS42L42_HSDET_AUTO_TIME_SHIFT));
+
+	/* Configure HS DET comparator reference levels. */
+	cs8409_i2c_write(cs42l42, CS42L42_HSDET_CTL1,
+			 (CS42L42_HSDET_COMP1_LVL_VAL << CS42L42_HSDET_COMP1_LVL_SHIFT) |
+			 (CS42L42_HSDET_COMP2_LVL_VAL << CS42L42_HSDET_COMP2_LVL_SHIFT));
+
+	/* Open the SW_HSB_HS3 switch and close SW_HSB_HS4 for a Type 1 headset. */
+	cs8409_i2c_write(cs42l42, CS42L42_HS_SWITCH_CTL, CS42L42_HSDET_SW_COMP1);
+
+	msleep(100);
+
+	hs_det_status = cs8409_i2c_read(cs42l42, CS42L42_HS_DET_STATUS);
+
+	hs_det_comp1 = (hs_det_status & CS42L42_HSDET_COMP1_OUT_MASK) >>
+			CS42L42_HSDET_COMP1_OUT_SHIFT;
+	hs_det_comp2 = (hs_det_status & CS42L42_HSDET_COMP2_OUT_MASK) >>
+			CS42L42_HSDET_COMP2_OUT_SHIFT;
+
+	/* Close the SW_HSB_HS3 switch for a Type 2 headset. */
+	cs8409_i2c_write(cs42l42, CS42L42_HS_SWITCH_CTL, CS42L42_HSDET_SW_COMP2);
+
+	msleep(100);
+
+	hs_det_status = cs8409_i2c_read(cs42l42, CS42L42_HS_DET_STATUS);
+
+	hs_det_comp1 |= ((hs_det_status & CS42L42_HSDET_COMP1_OUT_MASK) >>
+			CS42L42_HSDET_COMP1_OUT_SHIFT) << 1;
+	hs_det_comp2 |= ((hs_det_status & CS42L42_HSDET_COMP2_OUT_MASK) >>
+			CS42L42_HSDET_COMP2_OUT_SHIFT) << 1;
+
+	/* Use Comparator 1 with 1.25V Threshold. */
+	switch (hs_det_comp1) {
+	case CS42L42_HSDET_COMP_TYPE1:
+		hs_type = CS42L42_PLUG_CTIA;
+		hs_det_sw = CS42L42_HSDET_SW_TYPE1;
+		break;
+	case CS42L42_HSDET_COMP_TYPE2:
+		hs_type = CS42L42_PLUG_OMTP;
+		hs_det_sw = CS42L42_HSDET_SW_TYPE2;
+		break;
+	default:
+		/* Fallback to Comparator 2 with 1.75V Threshold. */
+		switch (hs_det_comp2) {
+		case CS42L42_HSDET_COMP_TYPE1:
+			hs_type = CS42L42_PLUG_CTIA;
+			hs_det_sw = CS42L42_HSDET_SW_TYPE1;
+			break;
+		case CS42L42_HSDET_COMP_TYPE2:
+			hs_type = CS42L42_PLUG_OMTP;
+			hs_det_sw = CS42L42_HSDET_SW_TYPE2;
+			break;
+		case CS42L42_HSDET_COMP_TYPE3:
+			hs_type = CS42L42_PLUG_HEADPHONE;
+			hs_det_sw = CS42L42_HSDET_SW_TYPE3;
+			break;
+		default:
+			hs_type = CS42L42_PLUG_INVALID;
+			hs_det_sw = CS42L42_HSDET_SW_TYPE4;
+			break;
+		}
+	}
+
+	/* Set Switches */
+	cs8409_i2c_write(cs42l42, CS42L42_HS_SWITCH_CTL, hs_det_sw);
+
+	/* Set HSDET mode to Manual—Disabled */
+	cs8409_i2c_write(cs42l42, CS42L42_HSDET_CTL2,
+			 (0 << CS42L42_HSDET_CTRL_SHIFT) |
+			 (0 << CS42L42_HSDET_SET_SHIFT) |
+			 (0 << CS42L42_HSBIAS_REF_SHIFT) |
+			 (0 << CS42L42_HSDET_AUTO_TIME_SHIFT));
+
+	/* Configure HS DET comparator reference levels. */
+	cs8409_i2c_write(cs42l42, CS42L42_HSDET_CTL1,
+			 (CS42L42_HSDET_COMP1_LVL_DEFAULT << CS42L42_HSDET_COMP1_LVL_SHIFT) |
+			 (CS42L42_HSDET_COMP2_LVL_DEFAULT << CS42L42_HSDET_COMP2_LVL_SHIFT));
+
+	return hs_type;
+}
+
+static int cs42l42_handle_tip_sense(struct sub_codec *cs42l42, unsigned int reg_ts_status)
+{
+	int status_changed = 0;
+
+	/* TIP_SENSE INSERT/REMOVE */
+	switch (reg_ts_status) {
+	case CS42L42_TS_PLUG:
+		if (cs42l42->no_type_dect) {
+			status_changed = 1;
+			cs42l42->hp_jack_in = 1;
+			cs42l42->mic_jack_in = 0;
+		} else {
+			cs42l42_run_jack_detect(cs42l42);
+		}
+		break;
+
+	case CS42L42_TS_UNPLUG:
+		status_changed = 1;
+		cs42l42->hp_jack_in = 0;
+		cs42l42->mic_jack_in = 0;
+		break;
+	default:
+		/* jack in transition */
+		break;
+	}
+
+	codec_dbg(cs42l42->codec, "Tip Sense Detection: (%d)\n", reg_ts_status);
+
+	return status_changed;
+}
+
+static int cs42l42_jack_unsol_event(struct sub_codec *cs42l42)
+{
+	int current_plug_status;
+	int status_changed = 0;
+	int reg_cdc_status;
+	int reg_hs_status;
+	int reg_ts_status;
+	int type;
+
+	/* Read jack detect status registers */
+	reg_cdc_status = cs8409_i2c_read(cs42l42, CS42L42_CODEC_STATUS);
+	reg_hs_status = cs8409_i2c_read(cs42l42, CS42L42_HS_DET_STATUS);
+	reg_ts_status = cs8409_i2c_read(cs42l42, CS42L42_TSRS_PLUG_STATUS);
+
+	/* If status values are < 0, read error has occurred. */
+	if (reg_cdc_status < 0 || reg_hs_status < 0 || reg_ts_status < 0)
+		return -EIO;
+
+	current_plug_status = (reg_ts_status & (CS42L42_TS_PLUG_MASK | CS42L42_TS_UNPLUG_MASK))
+				>> CS42L42_TS_PLUG_SHIFT;
+
+	/* HSDET_AUTO_DONE */
+	if (reg_cdc_status & CS42L42_HSDET_AUTO_DONE_MASK) {
+
+		/* Disable HSDET_AUTO_DONE */
+		cs8409_i2c_write(cs42l42, CS42L42_CODEC_INT_MASK, 0xFF);
+
+		type = (reg_hs_status & CS42L42_HSDET_TYPE_MASK) >> CS42L42_HSDET_TYPE_SHIFT;
+
+		/* Configure the HSDET mode. */
+		cs8409_i2c_write(cs42l42, CS42L42_HSDET_CTL2, 0x80);
+
+		if (cs42l42->no_type_dect) {
+			status_changed = cs42l42_handle_tip_sense(cs42l42, current_plug_status);
+		} else {
+			if (type == CS42L42_PLUG_INVALID || type == CS42L42_PLUG_HEADPHONE) {
+				codec_dbg(cs42l42->codec,
+					  "Auto detect value not valid (%d), running manual det\n",
+					  type);
+				type = cs42l42_manual_hs_det(cs42l42);
+			}
+
+			switch (type) {
+			case CS42L42_PLUG_CTIA:
+			case CS42L42_PLUG_OMTP:
+				status_changed = 1;
+				cs42l42->hp_jack_in = 1;
+				cs42l42->mic_jack_in = 1;
+				break;
+			case CS42L42_PLUG_HEADPHONE:
+				status_changed = 1;
+				cs42l42->hp_jack_in = 1;
+				cs42l42->mic_jack_in = 0;
+				break;
+			default:
+				status_changed = 1;
+				cs42l42->hp_jack_in = 0;
+				cs42l42->mic_jack_in = 0;
+				break;
+			}
+			codec_dbg(cs42l42->codec, "Detection done (%d)\n", type);
+		}
+
+		/* Enable the HPOUT ground clamp and configure the HP pull-down */
+		cs8409_i2c_write(cs42l42, CS42L42_DAC_CTL2, 0x02);
+		/* Re-Enable Tip Sense Interrupt */
+		cs8409_i2c_write(cs42l42, CS42L42_TSRS_PLUG_INT_MASK, 0xF3);
+	} else {
+		status_changed = cs42l42_handle_tip_sense(cs42l42, current_plug_status);
+	}
+
+	return status_changed;
+}
+
+static void cs42l42_resume(struct sub_codec *cs42l42)
+{
+	struct hda_codec *codec = cs42l42->codec;
+	struct cs8409_spec *spec = codec->spec;
+	struct cs8409_i2c_param irq_regs[] = {
+		{ CS42L42_CODEC_STATUS, 0x00 },
+		{ CS42L42_DET_INT_STATUS1, 0x00 },
+		{ CS42L42_DET_INT_STATUS2, 0x00 },
+		{ CS42L42_TSRS_PLUG_STATUS, 0x00 },
+	};
+	unsigned int fsv;
+
+	/* Bring CS42L42 out of Reset */
+	spec->gpio_data = snd_hda_codec_read(codec, CS8409_PIN_AFG, 0, AC_VERB_GET_GPIO_DATA, 0);
+	spec->gpio_data |= cs42l42->reset_gpio;
+	snd_hda_codec_write(codec, CS8409_PIN_AFG, 0, AC_VERB_SET_GPIO_DATA, spec->gpio_data);
+	usleep_range(10000, 15000);
+
+	cs42l42->suspended = 0;
+
+	/* Initialize CS42L42 companion codec */
+	cs8409_i2c_bulk_write(cs42l42, cs42l42->init_seq, cs42l42->init_seq_num);
+
+	/* Clear interrupts, by reading interrupt status registers */
+	cs8409_i2c_bulk_read(cs42l42, irq_regs, ARRAY_SIZE(irq_regs));
+
+	fsv = cs8409_i2c_read(cs42l42, CS42L42_HP_CTL);
+	if (cs42l42->full_scale_vol) {
+		// Set the full scale volume bit
+		fsv |= CS42L42_FULL_SCALE_VOL_MASK;
+		cs8409_i2c_write(cs42l42, CS42L42_HP_CTL, fsv);
+	}
+	// Unmute analog channels A and B
+	fsv = (fsv & ~CS42L42_ANA_MUTE_AB);
+	cs8409_i2c_write(cs42l42, CS42L42_HP_CTL, fsv);
+
+	/* we have to explicitly allow unsol event handling even during the
+	 * resume phase so that the jack event is processed properly
+	 */
+	snd_hda_codec_allow_unsol_events(cs42l42->codec);
+
+	cs42l42_enable_jack_detect(cs42l42);
+}
+
+void cs42l42_suspend(struct sub_codec *cs42l42)
+{
+	struct hda_codec *codec = cs42l42->codec;
+	struct cs8409_spec *spec = codec->spec;
+	int reg_cdc_status = 0;
+	const struct cs8409_i2c_param cs42l42_pwr_down_seq[] = {
+		{ CS42L42_DAC_CTL2, 0x02 },
+		{ CS42L42_HS_CLAMP_DISABLE, 0x00 },
+		{ CS42L42_MIXER_CHA_VOL, 0x3F },
+		{ CS42L42_MIXER_ADC_VOL, 0x3F },
+		{ CS42L42_MIXER_CHB_VOL, 0x3F },
+		{ CS42L42_HP_CTL, 0x0D },
+		{ CS42L42_ASP_RX_DAI0_EN, 0x00 },
+		{ CS42L42_ASP_CLK_CFG, 0x00 },
+		{ CS42L42_PWR_CTL1, 0xFE },
+		{ CS42L42_PWR_CTL2, 0x8C },
+		{ CS42L42_PWR_CTL1, 0xFF },
+	};
+
+	cs8409_i2c_bulk_write(cs42l42, cs42l42_pwr_down_seq, ARRAY_SIZE(cs42l42_pwr_down_seq));
+
+	if (read_poll_timeout(cs8409_i2c_read, reg_cdc_status,
+			(reg_cdc_status & 0x1), CS42L42_PDN_SLEEP_US, CS42L42_PDN_TIMEOUT_US,
+			true, cs42l42, CS42L42_CODEC_STATUS) < 0)
+		codec_warn(codec, "Timeout waiting for PDN_DONE for CS42L42\n");
+
+	/* Power down CS42L42 ASP/EQ/MIX/HP */
+	cs8409_i2c_write(cs42l42, CS42L42_PWR_CTL2, 0x9C);
+	cs42l42->suspended = 1;
+	cs42l42->last_page = 0;
+	cs42l42->hp_jack_in = 0;
+	cs42l42->mic_jack_in = 0;
+
+	/* Put CS42L42 into Reset */
+	spec->gpio_data = snd_hda_codec_read(codec, CS8409_PIN_AFG, 0, AC_VERB_GET_GPIO_DATA, 0);
+	spec->gpio_data &= ~cs42l42->reset_gpio;
+	snd_hda_codec_write(codec, CS8409_PIN_AFG, 0, AC_VERB_SET_GPIO_DATA, spec->gpio_data);
+}
+
+/* CS42L83 power-down. The Dell CS42L42 power-down sequence polls a status bit
+ * the CS42L83 doesn't drive the same way (causing repeated PDN_DONE timeouts),
+ * so use a minimal sequence: mute the headphone, power the codec down via its
+ * Power Down Control 1 register, then assert reset through the GPIO line.
+ */
+void cs42l83_suspend(struct sub_codec *cs42l83)
+{
+	struct hda_codec *codec = cs42l83->codec;
+	struct cs8409_spec *spec = codec->spec;
+
+	cs8409_i2c_write(cs42l83, CS42L42_HP_CTL, 0x0D);	/* mute HP (analog A+B) */
+	cs8409_i2c_write(cs42l83, CS42L42_PWR_CTL1, 0xFF);	/* power everything down */
+
+	cs42l83->suspended = 1;
+	cs42l83->last_page = 0;
+	cs42l83->hp_jack_in = 0;
+	cs42l83->mic_jack_in = 0;
+
+	/* Put CS42L83 into Reset */
+	spec->gpio_data = snd_hda_codec_read(codec, CS8409_PIN_AFG, 0, AC_VERB_GET_GPIO_DATA, 0);
+	spec->gpio_data &= ~cs42l83->reset_gpio;
+	snd_hda_codec_write(codec, CS8409_PIN_AFG, 0, AC_VERB_SET_GPIO_DATA, spec->gpio_data);
+}
+
+static void cs8409_remove(struct hda_codec *codec)
+{
+	struct cs8409_spec *spec = codec->spec;
+
+	/* Cancel i2c clock disable timer, and disable clock if left enabled */
+	cancel_delayed_work_sync(&spec->i2c_clk_work);
+	cancel_delayed_work_sync(&spec->jack_poll_work);
+	cs8409_disable_i2c_clock(codec);
+
+	snd_hda_gen_remove(codec);
+}
+
+/******************************************************************************
+ *                   BULLSEYE / WARLOCK / CYBORG Specific Functions
+ *                               CS8409/CS42L42
+ ******************************************************************************/
+
+/*
+ * In the case of CS8409 we do not have unsolicited events from NID's 0x24
+ * and 0x34 where hs mic and hp are connected. Companion codec CS42L42 will
+ * generate interrupt via gpio 4 to notify jack events. We have to overwrite
+ * generic snd_hda_jack_unsol_event(), read CS42L42 jack detect status registers
+ * and then notify status via generic snd_hda_jack_unsol_event() call.
+ */
+static void cs8409_cs42l42_jack_unsol_event(struct hda_codec *codec, unsigned int res)
+{
+	struct cs8409_spec *spec = codec->spec;
+	struct sub_codec *cs42l42 = spec->scodecs[CS8409_CODEC0];
+	struct hda_jack_tbl *jk;
+
+	/* jack_unsol_event() will be called every time gpio line changing state.
+	 * In this case gpio4 line goes up as a result of reading interrupt status
+	 * registers in previous cs8409_jack_unsol_event() call.
+	 * We don't need to handle this event, ignoring...
+	 */
+	if (res & cs42l42->irq_mask)
+		return;
+
+	if (cs42l42_jack_unsol_event(cs42l42)) {
+		snd_hda_set_pin_ctl(codec, CS8409_CS42L42_SPK_PIN_NID,
+				    cs42l42->hp_jack_in ? 0 : PIN_OUT);
+		/* Report jack*/
+		jk = snd_hda_jack_tbl_get_mst(codec, CS8409_CS42L42_HP_PIN_NID, 0);
+		if (jk)
+			snd_hda_jack_unsol_event(codec, (jk->tag << AC_UNSOL_RES_TAG_SHIFT) &
+							AC_UNSOL_RES_TAG);
+		/* Report jack*/
+		jk = snd_hda_jack_tbl_get_mst(codec, CS8409_CS42L42_AMIC_PIN_NID, 0);
+		if (jk)
+			snd_hda_jack_unsol_event(codec, (jk->tag << AC_UNSOL_RES_TAG_SHIFT) &
+							 AC_UNSOL_RES_TAG);
+	}
+}
+
+static void cs8409_unsol_event(struct hda_codec *codec, unsigned int res)
+{
+	struct cs8409_spec *spec = codec->spec;
+
+	if (spec->unsol_event)
+		spec->unsol_event(codec, res);
+	else
+		cs8409_cs42l42_jack_unsol_event(codec, res);
+}
+
+/* Manage PDREF, when transition to D3hot */
+static int cs8409_cs42l42_suspend(struct hda_codec *codec)
+{
+	struct cs8409_spec *spec = codec->spec;
+	int i;
+
+	spec->init_done = 0;
+
+	cs8409_enable_ur(codec, 0);
+
+	/* Stop the iMac tip-sense poll (no-op on boards that never start it). */
+	cancel_delayed_work_sync(&spec->jack_poll_work);
+
+	for (i = 0; i < spec->num_scodecs; i++)
+		spec->scodecs[i]->suspend(spec->scodecs[i]);
+
+	/* Cancel i2c clock disable timer, and disable clock if left enabled */
+	cancel_delayed_work_sync(&spec->i2c_clk_work);
+	cs8409_disable_i2c_clock(codec);
+
+	snd_hda_shutup_pins(codec);
+
+	return 0;
+}
+
+/* Vendor specific HW configuration
+ * PLL, ASP, I2C, SPI, GPIOs, DMIC etc...
+ */
+static void cs8409_cs42l42_hw_init(struct hda_codec *codec)
+{
+	const struct cs8409_cir_param *seq = cs8409_cs42l42_hw_cfg;
+	const struct cs8409_cir_param *seq_bullseye = cs8409_cs42l42_bullseye_atn;
+	struct cs8409_spec *spec = codec->spec;
+	struct sub_codec *cs42l42 = spec->scodecs[CS8409_CODEC0];
+
+	if (spec->gpio_mask) {
+		snd_hda_codec_write(codec, CS8409_PIN_AFG, 0, AC_VERB_SET_GPIO_MASK,
+			spec->gpio_mask);
+		snd_hda_codec_write(codec, CS8409_PIN_AFG, 0, AC_VERB_SET_GPIO_DIRECTION,
+			spec->gpio_dir);
+		snd_hda_codec_write(codec, CS8409_PIN_AFG, 0, AC_VERB_SET_GPIO_DATA,
+			spec->gpio_data);
+	}
+
+	for (; seq->nid; seq++)
+		cs8409_vendor_coef_set(codec, seq->cir, seq->coeff);
+
+	if (codec->fixup_id == CS8409_BULLSEYE) {
+		for (; seq_bullseye->nid; seq_bullseye++)
+			cs8409_vendor_coef_set(codec, seq_bullseye->cir, seq_bullseye->coeff);
+	}
+
+	switch (codec->fixup_id) {
+	case CS8409_CYBORG:
+	case CS8409_WARLOCK_MLK_DUAL_MIC:
+		/* DMIC1_MO=00b, DMIC1/2_SR=1 */
+		cs8409_vendor_coef_set(codec, CS8409_DMIC_CFG, 0x0003);
+		break;
+	case CS8409_ODIN:
+		/* ASP1/2_xxx_EN=1, ASP1/2_MCLK_EN=0, DMIC1_SCL_EN=0 */
+		cs8409_vendor_coef_set(codec, CS8409_PAD_CFG_SLW_RATE_CTRL, 0xfc00);
+		break;
+	default:
+		break;
+	}
+
+	cs42l42_resume(cs42l42);
+
+	/* Enable Unsolicited Response */
+	cs8409_enable_ur(codec, 1);
+}
+
+static int cs8409_cs42l42_exec_verb(struct hdac_device *dev, unsigned int cmd, unsigned int flags,
+				    unsigned int *res)
+{
+	struct hda_codec *codec = container_of(dev, struct hda_codec, core);
+	struct cs8409_spec *spec = codec->spec;
+	struct sub_codec *cs42l42 = spec->scodecs[CS8409_CODEC0];
+
+	unsigned int nid = ((cmd >> 20) & 0x07f);
+	unsigned int verb = ((cmd >> 8) & 0x0fff);
+
+	/* CS8409 pins have no AC_PINSENSE_PRESENCE capabilities. We have to
+	 * intercept the headphone/mic GET_PIN_SENSE calls and return correct
+	 * pin sense values for read_pin_sense() from hda_jack based on the
+	 * companion codec's jack-detect status. The headphone/mic pins differ
+	 * per board (Dell CS42L42 on ASP1, Apple CS42L83 on ASP2), so read them
+	 * from the companion codec rather than hard-coding them here.
+	 */
+	if (verb == AC_VERB_GET_PIN_SENSE) {
+		if (nid == cs42l42->hp_pin_nid) {
+			*res = (cs42l42->hp_jack_in) ? AC_PINSENSE_PRESENCE : 0;
+			return 0;
+		}
+		if (nid == cs42l42->amic_pin_nid) {
+			*res = (cs42l42->mic_jack_in) ? AC_PINSENSE_PRESENCE : 0;
+			return 0;
+		}
+	}
+
+	return spec->exec_verb(dev, cmd, flags, res);
+}
+
+void cs8409_cs42l42_fixups(struct hda_codec *codec, const struct hda_fixup *fix, int action)
+{
+	struct cs8409_spec *spec = codec->spec;
+
+	switch (action) {
+	case HDA_FIXUP_ACT_PRE_PROBE:
+		snd_hda_add_verbs(codec, cs8409_cs42l42_init_verbs);
+		/* verb exec op override */
+		spec->exec_verb = codec->core.exec_verb;
+		codec->core.exec_verb = cs8409_cs42l42_exec_verb;
+
+		spec->scodecs[CS8409_CODEC0] = &cs8409_cs42l42_codec;
+		spec->num_scodecs = 1;
+		spec->scodecs[CS8409_CODEC0]->codec = codec;
+
+		spec->gen.suppress_auto_mute = 1;
+		spec->gen.no_primary_hp = 1;
+		spec->gen.suppress_vmaster = 1;
+
+		spec->speaker_pdn_gpio = 0;
+
+		/* GPIO 5 out, 3,4 in */
+		spec->gpio_dir = spec->scodecs[CS8409_CODEC0]->reset_gpio;
+		spec->gpio_data = 0;
+		spec->gpio_mask = 0x03f;
+
+		/* Basic initial sequence for specific hw configuration */
+		snd_hda_sequence_write(codec, cs8409_cs42l42_init_verbs);
+
+		cs8409_fix_caps(codec, CS8409_CS42L42_HP_PIN_NID);
+		cs8409_fix_caps(codec, CS8409_CS42L42_AMIC_PIN_NID);
+
+		spec->scodecs[CS8409_CODEC0]->hsbias_hiz = 0x0020;
+
+		switch (codec->fixup_id) {
+		case CS8409_CYBORG:
+			spec->scodecs[CS8409_CODEC0]->full_scale_vol =
+				CS42L42_FULL_SCALE_VOL_MINUS6DB;
+			spec->speaker_pdn_gpio = CS8409_CYBORG_SPEAKER_PDN;
+			break;
+		case CS8409_ODIN:
+			spec->scodecs[CS8409_CODEC0]->full_scale_vol = CS42L42_FULL_SCALE_VOL_0DB;
+			spec->speaker_pdn_gpio = CS8409_CYBORG_SPEAKER_PDN;
+			break;
+		case CS8409_WARLOCK_MLK:
+		case CS8409_WARLOCK_MLK_DUAL_MIC:
+			spec->scodecs[CS8409_CODEC0]->full_scale_vol = CS42L42_FULL_SCALE_VOL_0DB;
+			spec->speaker_pdn_gpio = CS8409_WARLOCK_SPEAKER_PDN;
+			break;
+		default:
+			spec->scodecs[CS8409_CODEC0]->full_scale_vol =
+				CS42L42_FULL_SCALE_VOL_MINUS6DB;
+			spec->speaker_pdn_gpio = CS8409_WARLOCK_SPEAKER_PDN;
+			break;
+		}
+
+		if (spec->speaker_pdn_gpio > 0) {
+			spec->gpio_dir |= spec->speaker_pdn_gpio;
+			spec->gpio_data |= spec->speaker_pdn_gpio;
+		}
+
+		break;
+	case HDA_FIXUP_ACT_PROBE:
+		/* Fix Sample Rate to 48kHz */
+		spec->gen.stream_analog_playback = &cs42l42_48k_pcm_analog_playback;
+		spec->gen.stream_analog_capture = &cs42l42_48k_pcm_analog_capture;
+		/* add hooks */
+		spec->gen.pcm_playback_hook = cs42l42_playback_pcm_hook;
+		spec->gen.pcm_capture_hook = cs42l42_capture_pcm_hook;
+		if (codec->fixup_id != CS8409_ODIN)
+			/* Set initial DMIC volume to -26 dB */
+			snd_hda_codec_amp_init_stereo(codec, CS8409_CS42L42_DMIC_ADC_PIN_NID,
+						      HDA_INPUT, 0, 0xff, 0x19);
+		snd_hda_gen_add_kctl(&spec->gen, "Headphone Playback Volume",
+				&cs42l42_dac_volume_mixer);
+		snd_hda_gen_add_kctl(&spec->gen, "Mic Capture Volume",
+				&cs42l42_adc_volume_mixer);
+		if (spec->speaker_pdn_gpio > 0)
+			snd_hda_gen_add_kctl(&spec->gen, "Speaker Playback Switch",
+					     &cs8409_spk_sw_ctrl);
+		/* Disable Unsolicited Response during boot */
+		cs8409_enable_ur(codec, 0);
+		snd_hda_codec_set_name(codec, "CS8409/CS42L42");
+		break;
+	case HDA_FIXUP_ACT_INIT:
+		cs8409_cs42l42_hw_init(codec);
+		spec->init_done = 1;
+		if (spec->init_done && spec->build_ctrl_done
+			&& !spec->scodecs[CS8409_CODEC0]->hp_jack_in)
+			cs42l42_run_jack_detect(spec->scodecs[CS8409_CODEC0]);
+		break;
+	case HDA_FIXUP_ACT_BUILD:
+		spec->build_ctrl_done = 1;
+		/* Run jack auto detect first time on boot
+		 * after controls have been added, to check if jack has
+		 * been already plugged in.
+		 * Run immediately after init.
+		 */
+		if (spec->init_done && spec->build_ctrl_done
+			&& !spec->scodecs[CS8409_CODEC0]->hp_jack_in)
+			cs42l42_run_jack_detect(spec->scodecs[CS8409_CODEC0]);
+		break;
+	default:
+		break;
+	}
+}
+
+/******************************************************************************
+ *                   Apple iMac18,3 Specific Functions
+ *                            CS8409/CS42L83
+ ******************************************************************************/
+
+/* DET_STATUS1 (0x1b77) tip-sense level (bit7) that means a plug is PRESENT.
+ *
+ * The iMac wires the CS42L83 tip-sense INVERTED relative to the Dell boards
+ * (the init sequence sets TIP_SENSE_INV in TIPSENSE_CTL, 0x1b73 = 0xe0 vs the
+ * Dell 0xc0). The shared CS42L42 TSRS_PLUG_STATUS encoding (TS_PLUG=3) does NOT
+ * apply here (it reads single bits, never 0/3), so use the raw tip-sense level
+ * instead. Measured with nothing plugged: DET_STATUS1 = 0x16, i.e. bit7 = 0;
+ * so a plug present reads bit7 = 1. If detection comes out backwards (speakers
+ * stay muted with nothing plugged, or the headphone never mutes the speakers),
+ * flip this to 0 and rebuild.
+ */
+#define CS42L83_TIP_SENSE_LEVEL_PRESENT	1
+
+/* Read the CS42L83 tip-sense level and update cs42l83->hp_jack_in.
+ * Returns 1 on a good read (hp_jack_in is current), <0 on I/O error.
+ */
+static int cs8409_cs42l83_jack_detect(struct sub_codec *cs42l83)
+{
+	struct cs8409_spec *spec = cs42l83->codec->spec;
+	int det_status1;
+	unsigned int tip;
+
+	det_status1 = cs8409_i2c_read(cs42l83, CS42L42_DET_STATUS1);
+	if (det_status1 < 0)
+		return -EIO;
+
+	/* Trace the raw register only when it changes (quiet poll); enable with
+	 * dynamic debug if jack detection ever needs re-checking.
+	 */
+	if (det_status1 != spec->jack_poll_last_det) {
+		codec_dbg(cs42l83->codec, "CS42L83 DET_STATUS1(0x1b77)=0x%02x\n", det_status1);
+		spec->jack_poll_last_det = det_status1;
+	}
+
+	tip = (det_status1 & CS42L42_TIP_SENSE_MASK) ? 1 : 0;
+	cs42l83->hp_jack_in = (tip == CS42L83_TIP_SENSE_LEVEL_PRESENT);
+	/* First-cut headset-mic detection: assume any plug may be a TRRS headset
+	 * and expose the jack mic whenever a jack is present. Plain headphones
+	 * simply yield a silent source. (No CTIA/OMTP type detection yet.)
+	 */
+	cs42l83->mic_jack_in = cs42l83->hp_jack_in;
+
+	return 1;
+}
+
+/* Notify the HDA core / userspace of the current headphone & mic pin sense
+ * (updates the jack kcontrols and lets PipeWire pick the headphone port).
+ */
+static void cs8409_cs42l83_report_jack(struct hda_codec *codec)
+{
+	struct hda_jack_tbl *jk;
+
+	jk = snd_hda_jack_tbl_get_mst(codec, CS8409_CS42L83_HP_PIN_NID, 0);
+	if (jk)
+		snd_hda_jack_unsol_event(codec, (jk->tag << AC_UNSOL_RES_TAG_SHIFT) &
+						AC_UNSOL_RES_TAG);
+	jk = snd_hda_jack_tbl_get_mst(codec, CS8409_CS42L83_AMIC_PIN_NID, 0);
+	if (jk)
+		snd_hda_jack_unsol_event(codec, (jk->tag << AC_UNSOL_RES_TAG_SHIFT) &
+						 AC_UNSOL_RES_TAG);
+}
+
+/* Enable/disable the internal-speaker TAS5764 amps via GPIO4 (the amp-enable
+ * line). Driven high at init = amps on; we gate it from the jack poll so the
+ * internal speakers are silenced whenever a headphone is plugged in. The
+ * generic parser and userspace never touch this GPIO, so this is conflict-free.
+ */
+static void cs8409_cs42l83_set_speaker_amps(struct hda_codec *codec, bool on)
+{
+	struct cs8409_spec *spec = codec->spec;
+	unsigned int data;
+
+	data = snd_hda_codec_read(codec, CS8409_PIN_AFG, 0, AC_VERB_GET_GPIO_DATA, 0);
+	if (on)
+		data |= CS8409_CS42L83_AMP_PDN;
+	else
+		data &= ~CS8409_CS42L83_AMP_PDN;
+
+	if (data == spec->gpio_data)
+		return;
+	spec->gpio_data = data;
+	snd_hda_codec_write(codec, CS8409_PIN_AFG, 0, AC_VERB_SET_GPIO_DATA, data);
+}
+
+/* Apply the current jack state to the outputs: internal speaker amps on only
+ * when no headphone is plugged, and notify the HDA core / userspace of the
+ * headphone jack presence (for the port indicator).
+ */
+static void cs8409_cs42l83_update_outputs(struct hda_codec *codec)
+{
+	struct cs8409_spec *spec = codec->spec;
+	struct sub_codec *cs42l83 = spec->scodecs[CS8409_CODEC0];
+
+	codec_dbg(codec, "CS42L83 headphone %s; internal speakers %s\n",
+		  cs42l83->hp_jack_in ? "plugged in" : "unplugged",
+		  cs42l83->hp_jack_in ? "muted" : "on");
+
+	cs8409_cs42l83_set_speaker_amps(codec, !cs42l83->hp_jack_in);
+
+	/* On unplug, tear down the headset-mic path (power off + bias HiZ). The
+	 * bring-up itself happens at capture time (capture hook / cap_sync_hook),
+	 * not here: the ASP2 clock is gated when idle, so enabling at plug time —
+	 * with no active capture — leaves the CS8409 RX desynced by the time capture
+	 * actually runs.
+	 */
+	if (!cs42l83->mic_jack_in) {
+		cs8409_cs42l83_headset_mic_disable(codec);
+		cs8409_cs42l83_headset_bias(codec, false);
+	}
+
+	cs8409_cs42l83_report_jack(codec);
+}
+
+/* Poll interval for the headphone jack (no interrupt is wired on this board). */
+#define CS42L83_JACK_POLL_MS	500
+
+/* Periodic tip-sense poll: the CS42L83 does not deliver a jack unsolicited
+ * response through the CS8409 on the iMac, so read the tip-sense on a timer and
+ * notify the HDA core (which auto-mutes the speakers) when the state changes.
+ */
+static void cs8409_cs42l83_jack_poll_work(struct work_struct *work)
+{
+	struct cs8409_spec *spec = container_of(work, struct cs8409_spec,
+						jack_poll_work.work);
+	struct hda_codec *codec = spec->codec;
+	struct sub_codec *cs42l83 = spec->scodecs[CS8409_CODEC0];
+	int prev = cs42l83->hp_jack_in;
+
+	if (!cs42l83->suspended &&
+	    cs8409_cs42l83_jack_detect(cs42l83) > 0 &&
+	    cs42l83->hp_jack_in != prev)
+		cs8409_cs42l83_update_outputs(codec);
+
+	queue_delayed_work(system_power_efficient_wq, &spec->jack_poll_work,
+			   msecs_to_jiffies(CS42L83_JACK_POLL_MS));
+}
+
+/* Jack unsolicited-response handler for the Apple CS42L83. The board wires no
+ * jack interrupt to the CS8409, so this is normally never called (detection is
+ * driven by cs8409_cs42l83_jack_poll_work); handle it anyway for robustness.
+ */
+static void cs8409_cs42l83_jack_unsol_event(struct hda_codec *codec, unsigned int res)
+{
+	struct cs8409_spec *spec = codec->spec;
+	struct sub_codec *cs42l83 = spec->scodecs[CS8409_CODEC0];
+
+	/* Ignore the GPIO edge produced by our own interrupt-status reads. */
+	if (res & cs42l83->irq_mask)
+		return;
+
+	if (cs8409_cs42l83_jack_detect(cs42l83) > 0)
+		cs8409_cs42l83_update_outputs(codec);
+}
+
+/* Bring up the internal speakers. The iMac drives 4 speakers via 4 TAS5764
+ * amplifiers on the CS8409 ASP1 4-channel TDM bus (amps at I2C 0xd8/0xda/
+ * 0xdc/0xde reading TDM channels 0/2/1/3). Ported from the macOS AppleHDA
+ * TAS576 setup; per-amp volume 0xcf (0 dB). Phase 1: programmed and enabled
+ * at init (always on); audio reaches the amps whenever the speaker DACs
+ * (nodes 0x02/0x03 -> pins 0x24/0x25) stream.
+ */
+static void cs8409_cs42l83_speaker_setup(struct hda_codec *codec)
+{
+	static const struct { unsigned int reg, val; } amp_reset[] = {
+		{ TAS5760_PWR_CTRL,	TAS5760_PWR_SHUTDOWN },	/* amp shut down */
+		{ TAS5760_DIGITAL_CTRL,	0x04 },			/* I2S format */
+		{ TAS5760_VOL_CTRL_CFG,	TAS5760_VOL_CTRL_CFG_BASE }, /* fade/mute, no slot */
+		{ TAS5760_VOL_LEFT,	TAS5760_VOL_0DB },
+		{ TAS5760_ANALOG_CTRL,	0x51 },			/* PWM rate x16 */
+		{ TAS5760_FAULT_CFG,	0x00 },
+		{ TAS5760_DIG_CLIP2,	0xff },
+		{ TAS5760_DIG_CLIP1,	0xfc },
+		{ TAS5760_REG13,	0x00 },
+		{ TAS5760_REG14,	0x02 },
+	};
+	static const unsigned int amp_addr[4] = {
+		CS8409_IMAC_AMP_L_TWEETER, CS8409_IMAC_AMP_L_WOOFER,
+		CS8409_IMAC_AMP_R_TWEETER, CS8409_IMAC_AMP_R_WOOFER,
+	};
+	/* TDM slot each amp reads. Physical wiring (confirmed via the 4.0 test):
+	 *   0xd8 = left tweeter, 0xda = left woofer,
+	 *   0xdc = right tweeter, 0xde = right woofer.
+	 * A 2ch stream duplicates as L,R,L,R across slots 0..3 (slots 0,2 = L;
+	 * slots 1,3 = R), so put both left speakers on an L slot and both right
+	 * speakers on an R slot: 0xd8,0xda -> 0,2 (L); 0xdc,0xde -> 1,3 (R). This
+	 * drives all four speakers with correct stereo.
+	 */
+	static const unsigned int amp_chan[4] = { 0x00, 0x02, 0x01, 0x03 };
+	unsigned int coef;
+	int a, i;
+
+	/* Reset all four amps. */
+	for (a = 0; a < 4; a++)
+		for (i = 0; i < ARRAY_SIZE(amp_reset); i++)
+			cs8409_amp_i2c_write(codec, amp_addr[a], amp_reset[i].reg,
+					     amp_reset[i].val);
+
+	/* CS8409 ASP1 4-channel TDM transmit path (speaker side), mirroring the
+	 * macOS setupTDMPath for amps 1-2 (ASP1.A) and 3-4 (ASP1.B).
+	 */
+	cs8409_vendor_coef_set(codec, ASP1_A_TX_CTRL1, 0x0800);
+	cs8409_vendor_coef_set(codec, ASP1_A_TX_CTRL2, 0x0820);
+	cs8409_vendor_coef_set(codec, ASP1_B_TX_CTRL1, 0x0840);
+	cs8409_vendor_coef_set(codec, ASP1_B_TX_CTRL2, 0x0860);
+	cs8409_vendor_coef_set(codec, CS8409_ASP1_CLK_CTRL2, 0x08ff);
+	/* These two are wholesale writes in the macOS sequence (LCHI=0, SCDIV);
+	 * keeping stale bits here gives the amps a malformed bit clock.
+	 */
+	cs8409_vendor_coef_set(codec, CS8409_ASP1_CLK_CTRL1, 0x8000);
+	cs8409_vendor_coef_set(codec, CS8409_ASP1_CLK_CTRL3, 0x0001);
+	cs8409_vendor_coef_set(codec, CS8409_DEV_CFG3, 0x0280);
+	coef = cs8409_vendor_coef_get(codec, CS8409_PAD_CFG_SLW_RATE_CTRL);
+	cs8409_vendor_coef_set(codec, CS8409_PAD_CFG_SLW_RATE_CTRL, coef | 0x5400);
+	coef = cs8409_vendor_coef_get(codec, CS8409_DEV_CFG2);
+	cs8409_vendor_coef_set(codec, CS8409_DEV_CFG2, coef | 0x0020); /* ASP1_EN */
+	cs8409_vendor_coef_set(codec, CS8409_ASP1_INTRN_STS, 0x001f);
+	coef = cs8409_vendor_coef_get(codec, CS8409_ASP_UNS_RESP_MASK);
+	cs8409_vendor_coef_set(codec, CS8409_ASP_UNS_RESP_MASK, coef | 0x400f);
+	snd_hda_codec_write(codec, CS8409_PIN_VENDOR_WIDGET, 0,
+			    CS8409_VENDOR_VERB_TDM_COMMIT, CS8409_TDM_COMMIT_VAL);
+
+	/* Configure each amp (I2S, TDM channel, gain, fault) and power it on. */
+	for (a = 0; a < ARRAY_SIZE(amp_addr); a++) {
+		/* TDM, 24-bit */
+		cs8409_amp_i2c_write(codec, amp_addr[a], TAS5760_DIGITAL_CTRL, 0x44);
+		/* unmute + TDM slot */
+		cs8409_amp_i2c_write(codec, amp_addr[a], TAS5760_VOL_CTRL_CFG,
+				     TAS5760_VOL_CTRL_CFG_BASE | amp_chan[a]);
+		/* analog gain */
+		cs8409_amp_i2c_write(codec, amp_addr[a], TAS5760_ANALOG_CTRL, 0x55);
+		cs8409_amp_i2c_write(codec, amp_addr[a], TAS5760_FAULT_CFG, 0x18);
+		cs8409_amp_i2c_write(codec, amp_addr[a], TAS5760_VOL_LEFT, TAS5760_VOL_0DB);
+		cs8409_amp_i2c_write(codec, amp_addr[a], TAS5760_REG13, 0x00);
+		cs8409_amp_i2c_write(codec, amp_addr[a], TAS5760_DIGITAL_CTRL, 0x44);
+		cs8409_amp_i2c_write(codec, amp_addr[a], TAS5760_PWR_CTRL, TAS5760_PWR_ON);
+	}
+}
+
+/* Vendor-specific HW configuration for the CS42L83 headphone path.
+ * Sets up the CS8409 ASP2 TDM transmit path (the Apple part routes headphone
+ * audio over ASP2, not ASP1), then resumes the companion CS42L83.
+ */
+static void cs8409_cs42l83_hw_init(struct hda_codec *codec)
+{
+	struct cs8409_spec *spec = codec->spec;
+	struct sub_codec *cs42l83 = spec->scodecs[CS8409_CODEC0];
+	unsigned int coef;
+
+	if (spec->gpio_mask) {
+		snd_hda_codec_write(codec, CS8409_PIN_AFG, 0, AC_VERB_SET_GPIO_MASK,
+			spec->gpio_mask);
+		snd_hda_codec_write(codec, CS8409_PIN_AFG, 0, AC_VERB_SET_GPIO_DIRECTION,
+			spec->gpio_dir);
+		snd_hda_codec_write(codec, CS8409_PIN_AFG, 0, AC_VERB_SET_GPIO_DATA,
+			spec->gpio_data);
+	}
+
+	/* CS8409 ASP2 headphone TDM path. This faithfully replicates the macOS
+	 * AppleHDATDMBusManagerCS8409::setupTDMPath(full=1) coefficient sequence
+	 * for the CS42L83 at 44.1kHz. The clock-divider registers (0x06/0x08)
+	 * differ from the Dell speaker values; getting them wrong yields silence.
+	 */
+	cs8409_vendor_coef_set(codec, ASP2_Tx_RATE1, 0xaaaa);		/* 0x15 */
+	cs8409_vendor_coef_set(codec, ASP2_Tx_NULL_INS_RMV, 0x0100);	/* 0x14 */
+	cs8409_vendor_coef_set(codec, ASP2_A_TX_CTRL1, 0x0800);		/* 0x29 */
+	cs8409_vendor_coef_set(codec, ASP2_A_TX_CTRL2, 0x0820);		/* 0x2a */
+
+	/* NB: the ASP2 RX (headset-mic) slot setup is NOT done here — it is applied
+	 * per-capture in cs8409_cs42l83_headset_mic_enable(), because the CS8409 RX
+	 * loses frame sync whenever the CS42L83 stops transmitting (mic torn down on
+	 * unplug) and must be re-armed to survive an unplug/replug cycle.
+	 */
+	cs8409_vendor_coef_set(codec, CS8409_DEV_CFG1, 0xb000);		/* 0x00 */
+	cs8409_vendor_coef_set(codec, CS8409_ASP2_CLK_CTRL2, 0x10ff);	/* 0x07 */
+	coef = cs8409_vendor_coef_get(codec, CS8409_DEV_CFG1);
+	cs8409_vendor_coef_set(codec, CS8409_DEV_CFG1, coef | 0x2000);
+	cs8409_vendor_coef_set(codec, CS8409_ASP2_CLK_CTRL1, 0x8000);	/* 0x06: LCHI=0 */
+	cs8409_vendor_coef_set(codec, CS8409_ASP2_CLK_CTRL3, 0x0040);	/* 0x08 base */
+	coef = cs8409_vendor_coef_get(codec, CS8409_PAD_CFG_SLW_RATE_CTRL);
+	/* +DMIC2 SCL: keep the internal-mic DMIC clock on permanently. Gating it
+	 * per-capture relied on the capture hook, which PipeWire does not reliably
+	 * invoke when the input switches, leaving the internal mic silent.
+	 */
+	cs8409_vendor_coef_set(codec, CS8409_PAD_CFG_SLW_RATE_CTRL,
+			       coef | 0xa800 | CS8409_PAD_DMIC2_SCL_EN); /* 0x82 */
+	cs8409_vendor_coef_set(codec, CS8409_DEV_CFG3, 0x0280);		/* 0x02 */
+
+	/* 44.1kHz sample-rate clocking (setSampleRate). */
+	coef = cs8409_vendor_coef_get(codec, CS8409_DEV_CFG2);
+	cs8409_vendor_coef_set(codec, CS8409_DEV_CFG2, (coef & ~0x0380) | 0x0200);
+	coef = cs8409_vendor_coef_get(codec, CS8409_ASP2_CLK_CTRL3);
+	cs8409_vendor_coef_set(codec, CS8409_ASP2_CLK_CTRL3, (coef & ~0x0007) | 0x0042);
+	coef = cs8409_vendor_coef_get(codec, CS8409_ASP2_CLK_CTRL2);
+	cs8409_vendor_coef_set(codec, CS8409_ASP2_CLK_CTRL2, (coef & ~0x01ff) | 0x10ff);
+	coef = cs8409_vendor_coef_get(codec, CS8409_DEV_CFG2);
+	cs8409_vendor_coef_set(codec, CS8409_DEV_CFG2, coef | 0x0040);
+
+	/* Configure the TDM unsolicited-response routing the macOS driver sets. */
+	cs8409_vendor_coef_set(codec, CS8409_ASP2_INTRN_STS, 0x001f);
+	coef = cs8409_vendor_coef_get(codec, CS8409_ASP_UNS_RESP_MASK);
+	cs8409_vendor_coef_set(codec, CS8409_ASP_UNS_RESP_MASK, coef | 0x800f);
+	snd_hda_codec_write(codec, CS8409_PIN_VENDOR_WIDGET, 0,
+			    CS8409_VENDOR_VERB_TDM_COMMIT, CS8409_TDM_COMMIT_VAL);
+
+	cs42l42_resume(cs42l83);
+
+	/* Bring up the internal-speaker amps on ASP1. */
+	cs8409_cs42l83_speaker_setup(codec);
+
+	/* Enable Unsolicited Response */
+	cs8409_enable_ur(codec, 1);
+
+	/* No jack interrupt is wired on this board, so start polling the
+	 * tip-sense to drive speaker/headphone auto-mute. Re-armed on resume
+	 * (this runs again), cancelled on suspend/remove.
+	 */
+	spec->jack_poll_last_det = -1;
+	mod_delayed_work(system_power_efficient_wq, &spec->jack_poll_work,
+			 msecs_to_jiffies(CS42L83_JACK_POLL_MS));
+}
+
+/* Apple playback hook. macOS configures/locks the CS42L83 at playback start,
+ * when the CS8409 ASP2 frame clock and data are actually streaming. Doing the
+ * companion-DAC bring-up only at init (clocks idle) leaves the PLL unlocked, so
+ * re-apply it here on PREPARE and log the resulting lock state.
+ */
+static void cs42l83_playback_pcm_hook(struct hda_pcm_stream *hinfo,
+				      struct hda_codec *codec,
+				      struct snd_pcm_substream *substream,
+				      int action)
+{
+	struct cs8409_spec *spec = codec->spec;
+	struct sub_codec *cs42l83 = spec->scodecs[CS8409_CODEC0];
+	unsigned int pwr;
+	int i;
+
+	switch (action) {
+	case HDA_GEN_PCM_ACT_PREPARE:
+		spec->playback_started = 1;
+		/* Re-run the CS42L83 bring-up with the ASP2 clocks live so the PLL
+		 * can lock.
+		 */
+		cs8409_i2c_bulk_write(cs42l83, cs42l83->init_seq, cs42l83->init_seq_num);
+
+		/* Power up the headphone output path. The boot/init value of
+		 * PWR_CTL1 (0x1101 = 0xfe) keeps HP/MIXER/ASP-in powered down; the
+		 * macOS output enable walks it 0xfe -> 0x9e -> 0x96, staging the
+		 * power-up and waiting for power-good (0x130b bit2) in between:
+		 *   clear 0x61 -> ASP_DAI + MIXER on, then clear 0x08 -> HP on.
+		 */
+		pwr = cs8409_i2c_read(cs42l83, CS42L42_PWR_CTL1);
+		cs8409_i2c_write(cs42l83, CS42L42_PWR_CTL1, pwr &
+				 ~(CS42L42_ASP_DAI_PDN_MASK | CS42L42_MIXER_PDN_MASK |
+				   CS42L42_PDN_ALL_MASK));
+		for (i = 0; i < CS42L83_PWR_GOOD_POLL_MAX; i++) {
+			if (cs8409_i2c_read(cs42l83, CS42L42_SRCPL_INT_STATUS) &
+			    CS42L83_SRCPL_OUT_LOCK)
+				break;
+			usleep_range(CS42L83_PWR_GOOD_POLL_US, CS42L83_PWR_GOOD_POLL_US + 500);
+		}
+		pwr = cs8409_i2c_read(cs42l83, CS42L42_PWR_CTL1);
+		cs8409_i2c_write(cs42l83, CS42L42_PWR_CTL1, pwr & ~CS42L42_HP_PDN_MASK);
+
+		/* Unmute the headphone (clear analog A/B mute in HP_CTL). */
+		cs8409_i2c_write(cs42l83, CS42L42_HP_CTL, 0x01);
+		break;
+	case HDA_GEN_PCM_ACT_CLEANUP:
+		spec->playback_started = 0;
+		cs42l42_mute(cs42l83, CS42L42_VOL_DAC, 0x3, true);
+		break;
+	default:
+		break;
+	}
+}
+
+/* Electret mic bias (HSBIAS 2.7V) with the HSDET2 handshake from the macOS
+ * powerHSBIAS sequence. This is analog and clock-independent, so it is driven by
+ * jack presence (on at plug, HiZ at unplug), NOT by capture — gating it on the
+ * capture hook left it off for every capture after the first under PipeWire.
+ */
+static void cs8409_cs42l83_headset_bias(struct hda_codec *codec, bool on)
+{
+	struct cs8409_spec *spec = codec->spec;
+	struct sub_codec *cs42l83 = spec->scodecs[CS8409_CODEC0];
+
+	if (on) {
+		cs8409_i2c_write(cs42l83, CS42L42_HSDET_CTL2, CS42L83_HSDET_CTL2_BIAS_CLOSE);
+		cs8409_i2c_write(cs42l83, CS42L42_MISC_DET_CTL, CS42L83_MISC_DET_HSBIAS_2V7);
+		cs8409_i2c_write(cs42l83, CS42L42_HSDET_CTL2, 0x00);
+	} else {
+		cs8409_i2c_write(cs42l83, CS42L42_MISC_DET_CTL, CS42L83_MISC_DET_HSBIAS_HIZ);
+	}
+}
+
+/* Headset-mic (jack 0x3c -> CS42L83 ADC -> ASP2 RX -> CS8409 ADC node 0x1a)
+ * capture bring-up, run at capture PREPARE. Ported from egorenar's macOS-RE
+ * AppleHDATDM_CS42L83 enable sequence. Two halves:
+ *  - CS8409 side: re-arm the ASP2 receive slots + TDM-UR. This MUST run every
+ *    capture, not just at hw_init: the CS8409 RX loses frame sync when the
+ *    CS42L83 stops transmitting (mic torn down on unplug), so without re-arming
+ *    here the mic reads digital zero after an unplug/replug cycle even though
+ *    every CS42L83 status register looks correct.
+ *  - CS42L83 side: mic bias, 44.1kHz input rate, ASP TX slots/enable, PWR_CTL1
+ *    input power-up (waiting for SRC lock), and the +20dB ADC digital boost.
+ * HP output (ASP2 TX / PWR_CTL1 bits 6/3) is left untouched.
+ */
+static void cs8409_cs42l83_headset_mic_enable(struct hda_codec *codec)
+{
+	struct cs8409_spec *spec = codec->spec;
+	struct sub_codec *cs42l83 = spec->scodecs[CS8409_CODEC0];
+	unsigned int reg, coef;
+	int i;
+
+	/* Re-arm the CS8409 ASP2 receive path (slots + TDM unsolicited-response),
+	 * re-locking RX frame sync to the CS42L83 transmitter.
+	 */
+	cs8409_vendor_coef_set(codec, ASP2_Rx_RATE1, 0xaccc);		/* 0x12 */
+	cs8409_vendor_coef_set(codec, ASP2_Rx_NULL_INS_RMV, 0x0001);	/* 0x11 */
+	cs8409_vendor_coef_set(codec, ASP2_A_RX_CTRL1, 0x0800);		/* 0x49 */
+	cs8409_vendor_coef_set(codec, ASP2_A_RX_CTRL2, 0x0820);		/* 0x4a */
+	cs8409_vendor_coef_set(codec, CS8409_ASP2_INTRN_STS, 0x001f);	/* 0x6c */
+	coef = cs8409_vendor_coef_get(codec, CS8409_ASP_UNS_RESP_MASK);	/* 0x71 */
+	cs8409_vendor_coef_set(codec, CS8409_ASP_UNS_RESP_MASK, coef | 0x800f);
+	snd_hda_codec_write(codec, CS8409_PIN_VENDOR_WIDGET, 0,
+			    CS8409_VENDOR_VERB_TDM_COMMIT, CS8409_TDM_COMMIT_VAL);
+
+	/* Assert the electret mic bias. */
+	cs8409_cs42l83_headset_bias(codec, true);
+
+	/* Input (= ADC output) sample rate, 44.1kHz (_setSampleRate). */
+	cs8409_i2c_write(cs42l83, CS42L42_SRC_SDOUT_FS, CS42L83_SRC_SDOUT_FS_44K1);
+	cs8409_i2c_write(cs42l83, CS42L42_SP_TX_FS, CS42L83_SP_TX_FS_44K1);
+	cs8409_i2c_write(cs42l83, CS42L42_OUT_ASRC_CLK, 0x00);	/* output ASRC clock = 6MHz */
+	reg = cs8409_i2c_read(cs42l83, CS42L42_FS_RATE_EN);
+	cs8409_i2c_write(cs42l83, CS42L42_FS_RATE_EN, reg | CS42L42_FS_EN_OASRC_96K);
+
+	/* ASP transmit slot map (_setupAudioInput). */
+	cs8409_i2c_write(cs42l83, CS42L42_ASP_TX_CH_AP_RES, 0x0a);	/* 0x2903 */
+	cs8409_i2c_write(cs42l83, CS42L42_ASP_TX_CH1_BIT_LSB, 0x00);	/* 0x2905 */
+	cs8409_i2c_write(cs42l83, CS42L42_ASP_TX_CH2_BIT_LSB, 0x20);	/* 0x290b */
+
+	/* Enable ASP transmit (channels 1+2). */
+	cs8409_i2c_write(cs42l83, CS42L42_ASP_TX_CH_EN, 0x03);		/* 0x2902 */
+	cs8409_i2c_write(cs42l83, CS42L42_ASP_TX_SZ_EN, 0x01);		/* 0x2901 */
+
+	/* Power up the full path to the macOS PWR_CTL1=0x12 state. The mic's output
+	 * SRC (OASRC, ADC -> ASP TX) only locks when the OUTPUT side (mixer + ASP
+	 * in) is powered, so powering only the input side leaves it unlocked and the
+	 * capture silent unless HP playback happened to power the output path. Walk
+	 * it in two stages like the macOS sequence: output side first (clear ASP_DAI
+	 * + MIXER + codec, wait OUT lock, clear HP), then input side (clear ASP_DAO,
+	 * wait IN lock, clear ADC).
+	 */
+	reg = cs8409_i2c_read(cs42l83, CS42L42_PWR_CTL1);
+	cs8409_i2c_write(cs42l83, CS42L42_PWR_CTL1, reg &
+			 ~(CS42L42_ASP_DAI_PDN_MASK | CS42L42_MIXER_PDN_MASK | CS42L42_PDN_ALL_MASK));
+	for (i = 0; i < CS42L83_PWR_GOOD_POLL_MAX; i++) {
+		if (cs8409_i2c_read(cs42l83, CS42L42_SRCPL_INT_STATUS) & CS42L83_SRCPL_OUT_LOCK)
+			break;
+		usleep_range(CS42L83_PWR_GOOD_POLL_US, CS42L83_PWR_GOOD_POLL_US + 500);
+	}
+	reg = cs8409_i2c_read(cs42l83, CS42L42_PWR_CTL1);
+	cs8409_i2c_write(cs42l83, CS42L42_PWR_CTL1, reg & ~CS42L42_HP_PDN_MASK);
+
+	reg = cs8409_i2c_read(cs42l83, CS42L42_PWR_CTL1);
+	cs8409_i2c_write(cs42l83, CS42L42_PWR_CTL1, reg &
+			 ~(CS42L42_ASP_DAO_PDN_MASK | CS42L42_PDN_ALL_MASK));
+	for (i = 0; i < CS42L83_PWR_GOOD_POLL_MAX; i++) {
+		if (cs8409_i2c_read(cs42l83, CS42L42_SRCPL_INT_STATUS) & CS42L83_SRCPL_IN_LOCK)
+			break;
+		usleep_range(CS42L83_PWR_GOOD_POLL_US, CS42L83_PWR_GOOD_POLL_US + 500);
+	}
+	reg = cs8409_i2c_read(cs42l83, CS42L42_PWR_CTL1);
+	cs8409_i2c_write(cs42l83, CS42L42_PWR_CTL1, reg & ~CS42L42_ADC_PDN_MASK);
+
+	/* Apply the +20dB ADC digital boost so a boom mic at the mouth reaches a
+	 * usable level. The capture volume itself is left to the "Mic Capture
+	 * Volume" (ADC_VOLUME) control — we deliberately do NOT write ADC_VOLUME
+	 * here, since doing so on every capture clobbered the user's setting.
+	 */
+	reg = cs8409_i2c_read(cs42l83, CS42L42_ADC_CTL);
+	cs8409_i2c_write(cs42l83, CS42L42_ADC_CTL, reg | CS42L83_ADC_DIG_BOOST);
+
+	/* Diagnostics (enable with dynamic debug): ADC/ASP-TX powered, bias on,
+	 * SRC locked (SRCPL bit0 IN + bit2 OUT), boost on, RX bus clocking.
+	 */
+	codec_dbg(codec,
+		  "headset mic enable: PWR_CTL1=0x%02x MISC_DET=0x%02x SRCPL=0x%02x ADC_CTL=0x%02x ADC_VOL=0x%02x TX_SZ/CH=0x%02x/0x%02x RX_SCLK=0x%04x\n",
+		   cs8409_i2c_read(cs42l83, CS42L42_PWR_CTL1),
+		   cs8409_i2c_read(cs42l83, CS42L42_MISC_DET_CTL),
+		   cs8409_i2c_read(cs42l83, CS42L42_SRCPL_INT_STATUS),
+		   cs8409_i2c_read(cs42l83, CS42L42_ADC_CTL),
+		   cs8409_i2c_read(cs42l83, CS42L42_ADC_VOLUME),
+		   cs8409_i2c_read(cs42l83, CS42L42_ASP_TX_SZ_EN),
+		   cs8409_i2c_read(cs42l83, CS42L42_ASP_TX_CH_EN),
+		   cs8409_vendor_coef_get(codec, CS8409_ASP2_RX_SCLK_COUNT));
+}
+
+/* Reverse of cs8409_cs42l83_headset_mic_enable: mute and power down the CS42L83
+ * input path only, leaving HP output bits and the CS8409 ASP2 RX config in place.
+ */
+static void cs8409_cs42l83_headset_mic_disable(struct hda_codec *codec)
+{
+	struct cs8409_spec *spec = codec->spec;
+	struct sub_codec *cs42l83 = spec->scodecs[CS8409_CODEC0];
+	unsigned int reg;
+
+	/* Power off codec input: set ADC_PDN then ASP_DAO; leave PDN_ALL/codec and
+	 * HP bits as they were so HP keeps working. Powering the ADC down silences
+	 * capture, so we don't touch ADC_VOLUME (it stays at the user's setting).
+	 * Mic bias is handled separately by cs8409_cs42l83_headset_bias.
+	 */
+	reg = cs8409_i2c_read(cs42l83, CS42L42_PWR_CTL1);
+	cs8409_i2c_write(cs42l83, CS42L42_PWR_CTL1, reg | CS42L42_ADC_PDN_MASK);
+	reg = cs8409_i2c_read(cs42l83, CS42L42_PWR_CTL1);
+	cs8409_i2c_write(cs42l83, CS42L42_PWR_CTL1, reg | CS42L42_ASP_DAO_PDN_MASK);
+
+	/* Disable ASP transmit. */
+	cs8409_i2c_write(cs42l83, CS42L42_ASP_TX_SZ_EN, 0x00);		/* 0x2901 */
+	cs8409_i2c_write(cs42l83, CS42L42_ASP_TX_CH_EN, 0x00);		/* 0x2902 */
+}
+
+/* Capture-source-change hook. The generic parser calls this when the input mux
+ * switches (e.g. PipeWire selecting the headset mic on jack replug) — the one
+ * reliable signal we get for that, since it does NOT issue a PCM PREPARE. Re-arm
+ * the headset-mic path here while the jack is present (the ASP2 clock is live
+ * during the active capture, so the CS8409 RX re-locks).
+ */
+static void cs8409_cs42l83_cap_sync_hook(struct hda_codec *codec,
+					 struct snd_kcontrol *kcontrol,
+					 struct snd_ctl_elem_value *ucontrol)
+{
+	struct cs8409_spec *spec = codec->spec;
+	struct sub_codec *cs42l83 = spec->scodecs[CS8409_CODEC0];
+
+	codec_dbg(codec, "cap_sync_hook hp_jack_in=%d\n", cs42l83->hp_jack_in);
+	if (cs42l83->hp_jack_in)
+		cs8409_cs42l83_headset_mic_enable(codec);
+}
+
+/* Apple capture hook. The internal DMIC is permanently clocked (hw_init), so it
+ * needs nothing here. The headset-mic path is (re)armed at capture PREPARE while
+ * the jack is present — this covers cold boot and fresh captures; the
+ * cap_sync_hook covers input switches (replug) where no PREPARE is issued.
+ */
+static void cs42l83_capture_pcm_hook(struct hda_pcm_stream *hinfo,
+				     struct hda_codec *codec,
+				     struct snd_pcm_substream *substream,
+				     int action)
+{
+	struct cs8409_spec *spec = codec->spec;
+	struct sub_codec *cs42l83 = spec->scodecs[CS8409_CODEC0];
+	struct hda_gen_spec *gen = &spec->gen;
+	unsigned int item = gen->cur_mux[0];
+	hda_nid_t sel_pin = (item < gen->input_mux.num_items) ? gen->imux_pins[item] : 0;
+
+	if (action == HDA_GEN_PCM_ACT_PREPARE) {
+		spec->capture_started = 1;
+		if (cs42l83->hp_jack_in)
+			cs8409_cs42l83_headset_mic_enable(codec);
+	} else if (action == HDA_GEN_PCM_ACT_CLEANUP) {
+		spec->capture_started = 0;
+	}
+
+	codec_dbg(codec, "capture hook: action=%d nid=0x%x item=%u sel_pin=0x%x hp_jack_in=%d\n",
+		  action, hinfo->nid, item, sel_pin, cs42l83->hp_jack_in);
+}
+
+void cs8409_cs42l83_fixups(struct hda_codec *codec, const struct hda_fixup *fix, int action)
+{
+	struct cs8409_spec *spec = codec->spec;
+
+	switch (action) {
+	case HDA_FIXUP_ACT_PRE_PROBE:
+		snd_hda_add_verbs(codec, cs8409_cs42l83_init_verbs);
+		/* verb exec op override */
+		spec->exec_verb = codec->core.exec_verb;
+		codec->core.exec_verb = cs8409_cs42l42_exec_verb;
+		/* custom unsol handler for the ASP2 headphone/mic pins */
+		spec->unsol_event = cs8409_cs42l83_jack_unsol_event;
+
+		spec->scodecs[CS8409_CODEC0] = &cs8409_cs42l83_codec;
+		spec->num_scodecs = 1;
+		spec->scodecs[CS8409_CODEC0]->codec = codec;
+
+		/* Internal speakers on ASP1 (driven by the TAS5764 amps). Keep their
+		 * BIOS internal-speaker pin configs so the parser exposes a Speakers
+		 * output alongside the headphone; the user selects between them.
+		 */
+		snd_hda_codec_set_pincfg(codec, CS8409_PIN_ASP1_TRANSMITTER_A, 0x90100110);
+		snd_hda_codec_set_pincfg(codec, CS8409_PIN_ASP1_TRANSMITTER_B, 0x90100111);
+
+		/* Keep the headphone pin's real (presence-capable) BIOS config
+		 * (0x002b4020 from cs8409_cs42l83_pincfgs) so userspace sees a real
+		 * headphone jack. Both the internal speakers and the headphone stay
+		 * active output paths in the parser; the driver itself mutes the
+		 * internal speakers by gating the external amps (GPIO4) from the
+		 * tip-sense poll. We suppress the generic auto-mute because (a) the
+		 * speakers parse as line-outs so it defaults off, and (b) WirePlumber
+		 * turns the "Auto-Mute Mode" control off and does cosmetic port
+		 * switching, so relying on it is unreliable.
+		 */
+		spec->gen.suppress_auto_mute = 1;
+		spec->gen.no_primary_hp = 1;
+		spec->gen.suppress_vmaster = 1;
+
+		spec->speaker_pdn_gpio = 0;
+
+		/* GPIO1 = CS42L83 reset (out), GPIO4 = external amp enable (out),
+		 * GPIO0 = CS42L83 IRQ (in). Drive reset + amp-enable high.
+		 */
+		spec->gpio_dir = spec->scodecs[CS8409_CODEC0]->reset_gpio |
+				 CS8409_CS42L83_AMP_PDN;
+		spec->gpio_data = spec->scodecs[CS8409_CODEC0]->reset_gpio |
+				  CS8409_CS42L83_AMP_PDN;
+		/* GPIO0 IRQ in, GPIO1 CS42L83 reset out, GPIO4 speaker-amp enable out */
+		spec->gpio_mask = 0x1f;
+
+		/* Basic initial sequence for specific hw configuration */
+		snd_hda_sequence_write(codec, cs8409_cs42l83_init_verbs);
+
+		cs8409_fix_caps(codec, CS8409_CS42L83_HP_PIN_NID);
+		cs8409_fix_caps(codec, CS8409_CS42L83_AMIC_PIN_NID);
+
+		spec->scodecs[CS8409_CODEC0]->hsbias_hiz = 0x0000;
+		spec->scodecs[CS8409_CODEC0]->full_scale_vol = CS42L42_FULL_SCALE_VOL_0DB;
+		/* Real jack detection seeds hp_jack_in at INIT/BUILD; start absent. */
+		spec->scodecs[CS8409_CODEC0]->hp_jack_in = 0;
+		break;
+	case HDA_FIXUP_ACT_PROBE:
+		/* Fix the sample rate to 44.1kHz (like the Dell machines fix
+		 * theirs to 48kHz). The ASP2 clock dividers and the CS42L83 SRC
+		 * sample-rate values used here are the macOS bring-up values,
+		 * which are calibrated for 44.1kHz; other rates would need a
+		 * second verified set of divider/SRC values.
+		 */
+		spec->gen.stream_analog_playback = &cs42l83_44k1_pcm_analog_playback;
+		spec->gen.stream_analog_capture = &cs42l83_44k1_pcm_analog_capture;
+		/* add hooks */
+		spec->gen.pcm_playback_hook = cs42l83_playback_pcm_hook;
+		spec->gen.pcm_capture_hook = cs42l83_capture_pcm_hook;
+		spec->gen.cap_sync_hook = cs8409_cs42l83_cap_sync_hook;
+		snd_hda_gen_add_kctl(&spec->gen, "Headphone Playback Volume",
+				&cs42l42_dac_volume_mixer);
+		snd_hda_gen_add_kctl(&spec->gen, "Mic Capture Volume",
+				&cs42l42_adc_volume_mixer);
+		/* Disable Unsolicited Response during boot */
+		cs8409_enable_ur(codec, 0);
+		snd_hda_codec_set_name(codec, "CS8409/CS42L83");
+		break;
+	case HDA_FIXUP_ACT_INIT:
+		cs8409_cs42l83_hw_init(codec);
+		spec->init_done = 1;
+		/* Seed the real jack state once both init and controls are up, and
+		 * apply it (gate the speaker amps, report the jack).
+		 */
+		if (spec->init_done && spec->build_ctrl_done) {
+			cs8409_cs42l83_jack_detect(spec->scodecs[CS8409_CODEC0]);
+			cs8409_cs42l83_update_outputs(codec);
+		}
+		break;
+	case HDA_FIXUP_ACT_BUILD:
+		spec->build_ctrl_done = 1;
+		if (spec->init_done && spec->build_ctrl_done) {
+			cs8409_cs42l83_jack_detect(spec->scodecs[CS8409_CODEC0]);
+			cs8409_cs42l83_update_outputs(codec);
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+static int cs8409_comp_bind(struct device *dev)
+{
+	struct hda_codec *codec = dev_to_hda_codec(dev);
+	struct cs8409_spec *spec = codec->spec;
+
+	return hda_component_manager_bind(codec, &spec->comps);
+}
+
+static void cs8409_comp_unbind(struct device *dev)
+{
+	struct hda_codec *codec = dev_to_hda_codec(dev);
+	struct cs8409_spec *spec = codec->spec;
+
+	hda_component_manager_unbind(codec, &spec->comps);
+}
+
+static const struct component_master_ops cs8409_comp_master_ops = {
+	.bind = cs8409_comp_bind,
+	.unbind = cs8409_comp_unbind,
+};
+
+static void cs8409_comp_playback_hook(struct hda_pcm_stream *hinfo, struct hda_codec *codec,
+				      struct snd_pcm_substream *sub, int action)
+{
+	struct cs8409_spec *spec = codec->spec;
+
+	hda_component_manager_playback_hook(&spec->comps, action);
+}
+
+static void cs8409_cdb35l56_four_hw_init(struct hda_codec *codec)
+{
+	const struct cs8409_cir_param *seq = cs8409_cdb35l56_four_hw_cfg;
+
+	for (; seq->nid; seq++)
+		cs8409_vendor_coef_set(codec, seq->cir, seq->coeff);
+}
+
+static int cs8409_spk_sw_get(struct snd_kcontrol *kcontrol,
+			     struct snd_ctl_elem_value *ucontrol)
+{
+	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+	struct cs8409_spec *spec = codec->spec;
+
+	ucontrol->value.integer.value[0] = !spec->speaker_muted;
+
+	return 0;
+}
+
+static int cs8409_spk_sw_put(struct snd_kcontrol *kcontrol,
+			     struct snd_ctl_elem_value *ucontrol)
+{
+	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+	struct cs8409_spec *spec = codec->spec;
+	bool muted = !ucontrol->value.integer.value[0];
+
+	if (muted == spec->speaker_muted)
+		return 0;
+
+	spec->speaker_muted = muted;
+
+	return 1;
+}
+
+static const struct snd_kcontrol_new cs8409_spk_sw_component_ctrl = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.info = snd_ctl_boolean_mono_info,
+	.get = cs8409_spk_sw_get,
+	.put = cs8409_spk_sw_put,
+};
+
+void cs8409_cdb35l56_four_autodet_fixup(struct hda_codec *codec,
+				  const struct hda_fixup *fix,
+				  int action)
+{
+	struct device *dev = hda_codec_dev(codec);
+	struct cs8409_spec *spec = codec->spec;
+	struct acpi_device *adev;
+	const char *bus = NULL;
+	static const struct {
+		const char *hid;
+		const char *name;
+	} acpi_ids[] = {{ "CSC3554", "cs35l54-hda" },
+			{ "CSC3556", "cs35l56-hda" },
+			{ "CSC3557", "cs35l57-hda" }};
+	char *match;
+	int i, count = 0, count_devindex = 0;
+	int ret;
+
+	switch (action) {
+	case HDA_FIXUP_ACT_PRE_PROBE: {
+		for (i = 0; i < ARRAY_SIZE(acpi_ids); ++i) {
+			adev = acpi_dev_get_first_match_dev(acpi_ids[i].hid, NULL, -1);
+			if (adev)
+				break;
+		}
+		if (!adev) {
+			dev_err(dev, "Failed to find ACPI entry for a Cirrus Amp\n");
+			return;
+		}
+
+		count = i2c_acpi_client_count(adev);
+		if (count > 0) {
+			bus = "i2c";
+		} else {
+			count = acpi_spi_count_resources(adev);
+			if (count > 0)
+				bus = "spi";
+		}
+
+		struct fwnode_handle *fwnode __free(fwnode_handle) =
+			fwnode_handle_get(acpi_fwnode_handle(adev));
+		acpi_dev_put(adev);
+
+		if (!bus) {
+			dev_err(dev, "Did not find any buses for %s\n", acpi_ids[i].hid);
+			return;
+		}
+
+		if (!fwnode) {
+			dev_err(dev, "Could not get fwnode for %s\n", acpi_ids[i].hid);
+			return;
+		}
+
+		/*
+		 * When available the cirrus,dev-index property is an accurate
+		 * count of the amps in a system and is used in preference to
+		 * the count of bus devices that can contain additional address
+		 * alias entries.
+		 */
+		count_devindex = fwnode_property_count_u32(fwnode, "cirrus,dev-index");
+		if (count_devindex > 0)
+			count = count_devindex;
+
+		match = devm_kasprintf(dev, GFP_KERNEL, "-%%s:00-%s.%%d", acpi_ids[i].name);
+		if (!match)
+			return;
+		dev_info(dev, "Found %d %s on %s (%s)\n", count, acpi_ids[i].hid, bus, match);
+
+		ret = hda_component_manager_init(codec, &spec->comps, count, bus,
+						 acpi_ids[i].hid, match,
+						 &cs8409_comp_master_ops);
+		if (ret)
+			return;
+
+		spec->gen.pcm_playback_hook = cs8409_comp_playback_hook;
+
+		snd_hda_add_verbs(codec, cs8409_cdb35l56_four_init_verbs);
+		snd_hda_sequence_write(codec, cs8409_cdb35l56_four_init_verbs);
+		break;
+	}
+	case HDA_FIXUP_ACT_PROBE:
+		spec->speaker_muted = 0; /* speakers begin enabled */
+		snd_hda_gen_add_kctl(&spec->gen, "Speaker Playback Switch",
+				     &cs8409_spk_sw_component_ctrl);
+		spec->gen.stream_analog_playback = &cs42l42_48k_pcm_analog_playback;
+		snd_hda_codec_set_name(codec, "CS8409/CS35L56");
+		break;
+	case HDA_FIXUP_ACT_INIT:
+		cs8409_cdb35l56_four_hw_init(codec);
+		break;
+	case HDA_FIXUP_ACT_FREE:
+		hda_component_manager_free(&spec->comps, &cs8409_comp_master_ops);
+		break;
+	}
+}
+
+/******************************************************************************
+ *                          Dolphin Specific Functions
+ *                               CS8409/ 2 X CS42L42
+ ******************************************************************************/
+
+/*
+ * In the case of CS8409 we do not have unsolicited events when
+ * hs mic and hp are connected. Companion codec CS42L42 will
+ * generate interrupt via irq_mask to notify jack events. We have to overwrite
+ * generic snd_hda_jack_unsol_event(), read CS42L42 jack detect status registers
+ * and then notify status via generic snd_hda_jack_unsol_event() call.
+ */
+static void dolphin_jack_unsol_event(struct hda_codec *codec, unsigned int res)
+{
+	struct cs8409_spec *spec = codec->spec;
+	struct sub_codec *cs42l42;
+	struct hda_jack_tbl *jk;
+
+	cs42l42 = spec->scodecs[CS8409_CODEC0];
+	if (!cs42l42->suspended && (~res & cs42l42->irq_mask) &&
+	    cs42l42_jack_unsol_event(cs42l42)) {
+		jk = snd_hda_jack_tbl_get_mst(codec, DOLPHIN_HP_PIN_NID, 0);
+		if (jk)
+			snd_hda_jack_unsol_event(codec,
+						 (jk->tag << AC_UNSOL_RES_TAG_SHIFT) &
+						  AC_UNSOL_RES_TAG);
+
+		jk = snd_hda_jack_tbl_get_mst(codec, DOLPHIN_AMIC_PIN_NID, 0);
+		if (jk)
+			snd_hda_jack_unsol_event(codec,
+						 (jk->tag << AC_UNSOL_RES_TAG_SHIFT) &
+						  AC_UNSOL_RES_TAG);
+	}
+
+	cs42l42 = spec->scodecs[CS8409_CODEC1];
+	if (!cs42l42->suspended && (~res & cs42l42->irq_mask) &&
+	    cs42l42_jack_unsol_event(cs42l42)) {
+		jk = snd_hda_jack_tbl_get_mst(codec, DOLPHIN_LO_PIN_NID, 0);
+		if (jk)
+			snd_hda_jack_unsol_event(codec,
+						 (jk->tag << AC_UNSOL_RES_TAG_SHIFT) &
+						  AC_UNSOL_RES_TAG);
+	}
+}
+
+/* Vendor specific HW configuration
+ * PLL, ASP, I2C, SPI, GPIOs, DMIC etc...
+ */
+static void dolphin_hw_init(struct hda_codec *codec)
+{
+	const struct cs8409_cir_param *seq = dolphin_hw_cfg;
+	struct cs8409_spec *spec = codec->spec;
+	struct sub_codec *cs42l42;
+	int i;
+
+	if (spec->gpio_mask) {
+		snd_hda_codec_write(codec, CS8409_PIN_AFG, 0, AC_VERB_SET_GPIO_MASK,
+				    spec->gpio_mask);
+		snd_hda_codec_write(codec, CS8409_PIN_AFG, 0, AC_VERB_SET_GPIO_DIRECTION,
+				    spec->gpio_dir);
+		snd_hda_codec_write(codec, CS8409_PIN_AFG, 0, AC_VERB_SET_GPIO_DATA,
+				    spec->gpio_data);
+	}
+
+	for (; seq->nid; seq++)
+		cs8409_vendor_coef_set(codec, seq->cir, seq->coeff);
+
+	for (i = 0; i < spec->num_scodecs; i++) {
+		cs42l42 = spec->scodecs[i];
+		cs42l42_resume(cs42l42);
+	}
+
+	/* Enable Unsolicited Response */
+	cs8409_enable_ur(codec, 1);
+}
+
+static int dolphin_exec_verb(struct hdac_device *dev, unsigned int cmd, unsigned int flags,
+			     unsigned int *res)
+{
+	struct hda_codec *codec = container_of(dev, struct hda_codec, core);
+	struct cs8409_spec *spec = codec->spec;
+	struct sub_codec *cs42l42 = spec->scodecs[CS8409_CODEC0];
+
+	unsigned int nid = ((cmd >> 20) & 0x07f);
+	unsigned int verb = ((cmd >> 8) & 0x0fff);
+
+	/* CS8409 pins have no AC_PINSENSE_PRESENCE
+	 * capabilities. We have to intercept calls for CS42L42 pins
+	 * and return correct pin sense values for read_pin_sense() call from
+	 * hda_jack based on CS42L42 jack detect status.
+	 */
+	switch (nid) {
+	case DOLPHIN_HP_PIN_NID:
+	case DOLPHIN_LO_PIN_NID:
+		if (nid == DOLPHIN_LO_PIN_NID)
+			cs42l42 = spec->scodecs[CS8409_CODEC1];
+		if (verb == AC_VERB_GET_PIN_SENSE) {
+			*res = (cs42l42->hp_jack_in) ? AC_PINSENSE_PRESENCE : 0;
+			return 0;
+		}
+		break;
+	case DOLPHIN_AMIC_PIN_NID:
+		if (verb == AC_VERB_GET_PIN_SENSE) {
+			*res = (cs42l42->mic_jack_in) ? AC_PINSENSE_PRESENCE : 0;
+			return 0;
+		}
+		break;
+	default:
+		break;
+	}
+
+	return spec->exec_verb(dev, cmd, flags, res);
+}
+
+void dolphin_fixups(struct hda_codec *codec, const struct hda_fixup *fix, int action)
+{
+	struct cs8409_spec *spec = codec->spec;
+	struct snd_kcontrol_new *kctrl;
+	int i;
+
+	switch (action) {
+	case HDA_FIXUP_ACT_PRE_PROBE:
+		snd_hda_add_verbs(codec, dolphin_init_verbs);
+		/* verb exec op override */
+		spec->exec_verb = codec->core.exec_verb;
+		codec->core.exec_verb = dolphin_exec_verb;
+
+		spec->scodecs[CS8409_CODEC0] = &dolphin_cs42l42_0;
+		spec->scodecs[CS8409_CODEC0]->codec = codec;
+		spec->scodecs[CS8409_CODEC1] = &dolphin_cs42l42_1;
+		spec->scodecs[CS8409_CODEC1]->codec = codec;
+		spec->num_scodecs = 2;
+		spec->gen.suppress_vmaster = 1;
+
+		spec->unsol_event = dolphin_jack_unsol_event;
+
+		/* GPIO 1,5 out, 0,4 in */
+		spec->gpio_dir = spec->scodecs[CS8409_CODEC0]->reset_gpio |
+				 spec->scodecs[CS8409_CODEC1]->reset_gpio;
+		spec->gpio_data = 0;
+		spec->gpio_mask = 0x03f;
+
+		/* Basic initial sequence for specific hw configuration */
+		snd_hda_sequence_write(codec, dolphin_init_verbs);
+
+		snd_hda_jack_add_kctl(codec, DOLPHIN_LO_PIN_NID, "Line Out", true,
+				      SND_JACK_HEADPHONE, NULL);
+
+		snd_hda_jack_add_kctl(codec, DOLPHIN_AMIC_PIN_NID, "Microphone", true,
+				      SND_JACK_MICROPHONE, NULL);
+
+		cs8409_fix_caps(codec, DOLPHIN_HP_PIN_NID);
+		cs8409_fix_caps(codec, DOLPHIN_LO_PIN_NID);
+		cs8409_fix_caps(codec, DOLPHIN_AMIC_PIN_NID);
+
+		spec->scodecs[CS8409_CODEC0]->full_scale_vol = CS42L42_FULL_SCALE_VOL_MINUS6DB;
+		spec->scodecs[CS8409_CODEC1]->full_scale_vol = CS42L42_FULL_SCALE_VOL_MINUS6DB;
+
+		break;
+	case HDA_FIXUP_ACT_PROBE:
+		/* Fix Sample Rate to 48kHz */
+		spec->gen.stream_analog_playback = &cs42l42_48k_pcm_analog_playback;
+		spec->gen.stream_analog_capture = &cs42l42_48k_pcm_analog_capture;
+		/* add hooks */
+		spec->gen.pcm_playback_hook = cs42l42_playback_pcm_hook;
+		spec->gen.pcm_capture_hook = cs42l42_capture_pcm_hook;
+		snd_hda_gen_add_kctl(&spec->gen, "Headphone Playback Volume",
+				     &cs42l42_dac_volume_mixer);
+		snd_hda_gen_add_kctl(&spec->gen, "Mic Capture Volume", &cs42l42_adc_volume_mixer);
+		kctrl = snd_hda_gen_add_kctl(&spec->gen, "Line Out Playback Volume",
+					     &cs42l42_dac_volume_mixer);
+		/* Update Line Out kcontrol template */
+		if (kctrl)
+			kctrl->private_value = HDA_COMPOSE_AMP_VAL_OFS(DOLPHIN_HP_PIN_NID, 3, CS8409_CODEC1,
+					       HDA_OUTPUT, CS42L42_VOL_DAC) | HDA_AMP_VAL_MIN_MUTE;
+		cs8409_enable_ur(codec, 0);
+		snd_hda_codec_set_name(codec, "CS8409/CS42L42");
+		break;
+	case HDA_FIXUP_ACT_INIT:
+		dolphin_hw_init(codec);
+		spec->init_done = 1;
+		if (spec->init_done && spec->build_ctrl_done) {
+			for (i = 0; i < spec->num_scodecs; i++) {
+				if (!spec->scodecs[i]->hp_jack_in)
+					cs42l42_run_jack_detect(spec->scodecs[i]);
+			}
+		}
+		break;
+	case HDA_FIXUP_ACT_BUILD:
+		spec->build_ctrl_done = 1;
+		/* Run jack auto detect first time on boot
+		 * after controls have been added, to check if jack has
+		 * been already plugged in.
+		 * Run immediately after init.
+		 */
+		if (spec->init_done && spec->build_ctrl_done) {
+			for (i = 0; i < spec->num_scodecs; i++) {
+				if (!spec->scodecs[i]->hp_jack_in)
+					cs42l42_run_jack_detect(spec->scodecs[i]);
+			}
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+static int cs8409_probe(struct hda_codec *codec, const struct hda_device_id *id)
+{
+	int err;
+
+	if (!cs8409_alloc_spec(codec))
+		return -ENOMEM;
+
+	snd_hda_pick_fixup(codec, cs8409_models, cs8409_fixup_tbl, cs8409_fixups);
+
+	codec_dbg(codec, "Picked ID=%d, VID=%08x, DEV=%08x\n", codec->fixup_id,
+			 codec->bus->pci->subsystem_vendor,
+			 codec->bus->pci->subsystem_device);
+
+	snd_hda_apply_fixup(codec, HDA_FIXUP_ACT_PRE_PROBE);
+
+	err = cs8409_parse_auto_config(codec);
+	if (err < 0) {
+		cs8409_remove(codec);
+		return err;
+	}
+
+	snd_hda_apply_fixup(codec, HDA_FIXUP_ACT_PROBE);
+	return 0;
+}
+
+static const struct hda_codec_ops cs8409_codec_ops = {
+	.probe = cs8409_probe,
+	.remove = cs8409_remove,
+	.build_controls = cs8409_build_controls,
+	.build_pcms = snd_hda_gen_build_pcms,
+	.init = cs8409_init,
+	.unsol_event = cs8409_unsol_event,
+	.suspend = cs8409_cs42l42_suspend,
+	.stream_pm = snd_hda_gen_stream_pm,
+};
+
+static const struct hda_device_id snd_hda_id_cs8409[] = {
+	HDA_CODEC_ID(0x10138409, "CS8409"),
+	{} /* terminator */
+};
+MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_cs8409);
+
+static struct hda_codec_driver cs8409_driver = {
+	.id = snd_hda_id_cs8409,
+	.ops = &cs8409_codec_ops,
+};
+module_hda_codec_driver(cs8409_driver);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Cirrus Logic HDA bridge");
+MODULE_IMPORT_NS("SND_HDA_SCODEC_COMPONENT");

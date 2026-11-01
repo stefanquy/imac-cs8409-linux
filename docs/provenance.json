@@ -1,0 +1,95 @@
+{
+  "research_date": "2026-11-01",
+  "immediate_upstream_repository": "https://github.com/petershevchenko/imac-sound",
+  "immediate_upstream_commit": "08f974ecf409b4a5482fcb5564e776d9db427b6e",
+  "functional_v133_commit": "c0b26d4f11c0ed4dea35a799a1d19a4b802fe9b3",
+  "verification": "Git blob SHA-1 computed from local Git object bytes and matched to public GitHub pinned tree; SHA-256 recorded independently",
+  "files": [
+    {
+      "path": "Kbuild",
+      "git_blob_sha1": "6b9b6d184621a8d98942ea4991a0e4c8628a416b",
+      "sha256": "da3e768325e4ea53943914f0e15568ff291f194a66bed7325cb165970087da57",
+      "packaged_sha256": "308d3db745a9b1e7b2963507be9c344c51d1840fbe3948a676dfaad827dd40a2",
+      "relationship": "license/dependency comments changed; build rules unchanged"
+    },
+    {
+      "path": "codecs/cirrus/cs8409-tables.c",
+      "git_blob_sha1": "e680d8c18ec708527d2fc44c8b0ca6ef3043b064",
+      "sha256": "d9e10bb74d4ba0c63721cf25e45e9b2362afc2780b8412cff6d5d0d8fd8eee81",
+      "packaged_sha256": "d9e10bb74d4ba0c63721cf25e45e9b2362afc2780b8412cff6d5d0d8fd8eee81",
+      "relationship": "exact"
+    },
+    {
+      "path": "codecs/cirrus/cs8409.c",
+      "git_blob_sha1": "d6392e807968d3a5fc9983d62372406cd2cd1b5c",
+      "sha256": "9ddeeaf405144cd64a9f4eb5d511d675fdd13714a58db5d77e13bb036cd3b90e",
+      "packaged_sha256": "9ddeeaf405144cd64a9f4eb5d511d675fdd13714a58db5d77e13bb036cd3b90e",
+      "relationship": "exact"
+    },
+    {
+      "path": "codecs/cirrus/cs8409.h",
+      "git_blob_sha1": "b4951671185bca081688808e2105eff796fbd23f",
+      "sha256": "fcb76f1bfffb93275a47a868dab20bc57cedc9a68354711a667222c5e984f368",
+      "packaged_sha256": "fcb76f1bfffb93275a47a868dab20bc57cedc9a68354711a667222c5e984f368",
+      "relationship": "exact"
+    },
+    {
+      "path": "codecs/generic.h",
+      "git_blob_sha1": "524591821f8c98d8ffcb015bbd2784c5a8ab4eee",
+      "sha256": "9175959750d86f715d15eb2e4c063a95861ed7d737418e9f55843b1af04446d6",
+      "packaged_sha256": "9175959750d86f715d15eb2e4c063a95861ed7d737418e9f55843b1af04446d6",
+      "relationship": "exact"
+    },
+    {
+      "path": "codecs/side-codecs/hda_component.h",
+      "git_blob_sha1": "075137a73baec53363fee04eb0bf91e30fa34724",
+      "sha256": "71559a1d0d50d05e63b593dac96a041791292500dfedd606334804487fbcc8ae",
+      "packaged_sha256": "71559a1d0d50d05e63b593dac96a041791292500dfedd606334804487fbcc8ae",
+      "relationship": "exact"
+    },
+    {
+      "path": "common/hda_auto_parser.h",
+      "git_blob_sha1": "87af3d8c02f7f68ffa7c9006fdcf43d836e939eb",
+      "sha256": "59c9e34e50f22e36ddc45dc22ca822838104e745884e6841bee73e65876a0716",
+      "packaged_sha256": "59c9e34e50f22e36ddc45dc22ca822838104e745884e6841bee73e65876a0716",
+      "relationship": "exact"
+    },
+    {
+      "path": "common/hda_jack.h",
+      "git_blob_sha1": "e9b9970c59ed4a8b30e93a9b5f18328a9ab2949f",
+      "sha256": "b6af84afebab898958e2a972acab3783ed1849c826961f8333f01bd127572b49",
+      "packaged_sha256": "b6af84afebab898958e2a972acab3783ed1849c826961f8333f01bd127572b49",
+      "relationship": "exact"
+    },
+    {
+      "path": "common/hda_local.h",
+      "git_blob_sha1": "ab423f1cef5492d9b6fca20a72c136c36d4c656b",
+      "sha256": "8271e0fafcf178cf77a783547ae44897dd19bf63f416c621175f04536159f7e4",
+      "packaged_sha256": "b9cc853f4ab575f9361d36b8c6d9ef3fc178e82f95ed3dca746505849d192078",
+      "relationship": "local ABI field and dated notice"
+    },
+    {
+      "path": "debian/copyright",
+      "git_blob_sha1": "71e1ea1ed76bf3ed2c98223ef9e048416c0a5271",
+      "sha256": "69794cceda0b713fb31d5070d7de434ac795ca2f76ab3ccc4fc105e89dffff72",
+      "packaged_sha256": "69794cceda0b713fb31d5070d7de434ac795ca2f76ab3ccc4fc105e89dffff72",
+      "relationship": "exact"
+    }
+  ],
+  "local_script_origin": "Owner confirmed creation in earlier ChatGPT/Codex sessions on 2026-11-01",
+  "older_sequence_license_scope": "Package-specific source-origin/license blocker closed by docs/EGORENKOV-LICENSE-REVIEW.md; no standalone new license grant for the entire historical Egorenkov repository is asserted.",
+  "earlier_lineage": {
+    "egorenar_commit": "d8c9001418e6172099a0907f022534f152e29d71",
+    "davidjo_historical_commit": "18f0201b67d1d50f99526453e833f585b5b28321",
+    "davidjo_license_inspected_at": "89b22ff90b86468b186706861dd18663562defa7",
+    "davidjo_license_blob": "31bf790b7eb0b985889e6b9ce854d310ab02d00a",
+    "historically_identical_blobs": {
+      "patch_cirrus_boot84.h": "4bb1a36965ca006530e4877ab8774812b010c2f3",
+      "patch_cirrus_real84.h": "1a1cd0440ffdd2df3baa1faaf528b6824b2479ab",
+      "patch_cirrus_real84_i2c.h": "c31b1c1e9179955190011854b779f1d81be3e276"
+    },
+    "davidjo_original_license_issue": "https://github.com/davidjo/snd_hda_macbookpro/issues/126",
+    "davidjo_license_addition_commit": "259cc39e243daef170f145ba87ad134239b5967f",
+    "followup_evidence": "egorenar-license-evidence.json"
+  }
+}

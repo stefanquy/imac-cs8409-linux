@@ -1,0 +1,14 @@
+{
+  "Kbuild": "da3e768325e4ea53943914f0e15568ff291f194a66bed7325cb165970087da57",
+  "dkms.conf": "668812fe1680f734043027a73c6855e399075303008f767c53809988243d21be",
+  "dkms-build.sh": "e28df169f82c8b56516519c459839a631f3c89ce5beedafb9f56cf1afe2441e9",
+  "verify-abi.py": "d0af056bd207407e6f2d7884f3b6cce27f0e0cb6955bcd20a983aa73dfe06824",
+  "codecs/cirrus/cs8409-tables.c": "d9e10bb74d4ba0c63721cf25e45e9b2362afc2780b8412cff6d5d0d8fd8eee81",
+  "codecs/cirrus/cs8409.c": "9ddeeaf405144cd64a9f4eb5d511d675fdd13714a58db5d77e13bb036cd3b90e",
+  "codecs/cirrus/cs8409.h": "fcb76f1bfffb93275a47a868dab20bc57cedc9a68354711a667222c5e984f368",
+  "codecs/generic.h": "9175959750d86f715d15eb2e4c063a95861ed7d737418e9f55843b1af04446d6",
+  "codecs/side-codecs/hda_component.h": "71559a1d0d50d05e63b593dac96a041791292500dfedd606334804487fbcc8ae",
+  "common/hda_auto_parser.h": "59c9e34e50f22e36ddc45dc22ca822838104e745884e6841bee73e65876a0716",
+  "common/hda_jack.h": "b6af84afebab898958e2a972acab3783ed1849c826961f8333f01bd127572b49",
+  "common/hda_local.h": "eab1670296f9cbdd7b1176ca92561f0a5b86a7aea0be02c6ccfd5b02af46608a"
+}

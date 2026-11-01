@@ -1,0 +1,742 @@
+{
+  "research_date": "2026-11-01",
+  "comparison": "Exact UTF-8 bytes; nonblank delta classification excludes whitespace-only edits, not comments or C statements",
+  "davidjo_baseline": "18f0201b67d1d50f99526453e833f585b5b28321",
+  "egorenar_commit": "d8c9001418e6172099a0907f022534f152e29d71",
+  "davidjo_license_added_commit": "259cc39e243daef170f145ba87ad134239b5967f",
+  "davidjo_license_issue": "https://github.com/davidjo/snd_hda_macbookpro/issues/126",
+  "files": [
+    {
+      "egor_path": "patch_cirrus_apple.h",
+      "davidjo_path": "patch_cirrus/patch_cirrus_apple.h",
+      "davidjo_git_blob": "fc2b2d06c6663a125eac84db87ca5d44cf4123cb",
+      "egor_git_blob": "9a9311ed4deabf7f2440aa686f75e5990c2bf0ba",
+      "davidjo_sha256": "7a5e21055e350c722140bbb2932042b722d6a72b99bc19df30d69ac67fbc68b9",
+      "egor_sha256": "f82f2a4846ddb8097b695cd68f51a3e1d2ac919cfa09f1cea3b3e3bab91a80d4",
+      "byte_identical": false,
+      "nonblank_changes": [
+        {
+          "historical_lines": [
+            158,
+            158
+          ],
+          "egor_lines": [
+            158,
+            157
+          ],
+          "removed": [
+            "        .force_status_change = 1,"
+          ],
+          "added": []
+        }
+      ]
+    },
+    {
+      "egor_path": "patch_cirrus_new84.h",
+      "davidjo_path": "patch_cirrus/patch_cirrus_new84.h",
+      "davidjo_git_blob": "887e91b596de45035bc6f485f4f0839e49e4b3de",
+      "egor_git_blob": "1eeb1839c25e19434ca6d7747698fe3ee5da4060",
+      "davidjo_sha256": "4a528bb99fca36e090b00d82f790f8bebcca5d5e259fb56be64d9f31e833fd71",
+      "egor_sha256": "a0e23c354d325d4bb72a9f6f2407ad872ba628a94b84675ebb7f1fdf19b5cf01",
+      "byte_identical": false,
+      "nonblank_changes": [
+        {
+          "historical_lines": [
+            660,
+            659
+          ],
+          "egor_lines": [
+            660,
+            660
+          ],
+          "removed": [],
+          "added": [
+            "\t\t\tbreak;"
+          ]
+        }
+      ]
+    },
+    {
+      "egor_path": "patch_cirrus_hda_generic_copy.h",
+      "davidjo_path": "patch_cirrus/patch_cirrus_hda_generic_copy.h",
+      "davidjo_git_blob": "78ddb75586b4e7fe966be8b7a8567be8adb0420f",
+      "egor_git_blob": "17b3ffd29e89d0b4d4193515ebed269df1a6994f",
+      "davidjo_sha256": "f405aa473b5aa0bfccb139a05e632dabe73af6aeb5757ab33d990c7571a3c281",
+      "egor_sha256": "d8ef05d94163aafbf727b1195573cd76fb370e3290cb931503ff645d6b07d98f",
+      "byte_identical": false,
+      "nonblank_changes": [
+        {
+          "historical_lines": [
+            343,
+            342
+          ],
+          "egor_lines": [
+            343,
+            344
+          ],
+          "removed": [],
+          "added": [
+            "\tif (knew->access == 0)",
+            "\t\tknew->access = SNDRV_CTL_ELEM_ACCESS_READWRITE;"
+          ]
+        },
+        {
+          "historical_lines": [
+            353,
+            353
+          ],
+          "egor_lines": [
+            355,
+            359
+          ],
+          "removed": [
+            "\tsnprintf(name, sizeof(name), \"%s %s %s\", pfx, dir, sfx);"
+          ],
+          "added": [
+            "\tint len;",
+            "\tlen = snprintf(name, sizeof(name), \"%s %s %s\", pfx, dir, sfx);",
+            "\tif (snd_BUG_ON(len >= sizeof(name)))",
+            "\t\treturn -EINVAL;"
+          ]
+        }
+      ]
+    },
+    {
+      "egor_path": "patch_cirrus_boot84.h",
+      "davidjo_path": "patch_cirrus/patch_cirrus_boot84.h",
+      "davidjo_git_blob": "4bb1a36965ca006530e4877ab8774812b010c2f3",
+      "egor_git_blob": "4bb1a36965ca006530e4877ab8774812b010c2f3",
+      "davidjo_sha256": "c5efdcec9cdf9cfc5b4975b4d238cdad98e2c4302e0c4067c70b73234b185fb9",
+      "egor_sha256": "c5efdcec9cdf9cfc5b4975b4d238cdad98e2c4302e0c4067c70b73234b185fb9",
+      "byte_identical": true,
+      "nonblank_changes": []
+    },
+    {
+      "egor_path": "patch_cirrus_real84.h",
+      "davidjo_path": "patch_cirrus/patch_cirrus_real84.h",
+      "davidjo_git_blob": "1a1cd0440ffdd2df3baa1faaf528b6824b2479ab",
+      "egor_git_blob": "1a1cd0440ffdd2df3baa1faaf528b6824b2479ab",
+      "davidjo_sha256": "9cda9bbdd0ebf3fbb9eeb34fd472c449537cc5bffd9de6337a42478ab1d4d43c",
+      "egor_sha256": "9cda9bbdd0ebf3fbb9eeb34fd472c449537cc5bffd9de6337a42478ab1d4d43c",
+      "byte_identical": true,
+      "nonblank_changes": []
+    },
+    {
+      "egor_path": "patch_cirrus_real84_i2c.h",
+      "davidjo_path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+      "davidjo_git_blob": "c31b1c1e9179955190011854b779f1d81be3e276",
+      "egor_git_blob": "c31b1c1e9179955190011854b779f1d81be3e276",
+      "davidjo_sha256": "2997c6a0dd42ad1406e907311db55ea296ee523225fec12cc5da971632790029",
+      "egor_sha256": "2997c6a0dd42ad1406e907311db55ea296ee523225fec12cc5da971632790029",
+      "byte_identical": true,
+      "nonblank_changes": []
+    }
+  ],
+  "packaged_code_identifiers_and_includes_verified_absent": [
+    "get_hda_cvt_setup_apple_8409",
+    "force_status_change",
+    "add_control_with_pfx",
+    "patch_cirrus_apple.h",
+    "patch_cirrus_new84.h",
+    "patch_cirrus_hda_generic_copy.h"
+  ],
+  "scope": "This comparison covers all six unmarked Apple headers added by the sole Apple-support commit in the inspected egorenar history. It does not claim a standalone new license grant for the entire egorenar repository.",
+  "packaged_init_sequence_crosscheck": {
+    "packaged_symbol": "cs42l83_init_reg_seq",
+    "packaged_entry_count": 61,
+    "entries_with_identical_register_value_pair_in_gpl2024_i2c_source": 61,
+    "unmatched_entries": [],
+    "interpretation": "Pair membership corroborates register-data origin; it does not by itself prove source-code authorship, order, copyrightability or a full semantic equivalence.",
+    "source_scope": "All inspected Apple/boot/new/real/i2c headers in the GPL2024 tree",
+    "per_entry_references": [
+      {
+        "register": "0x1103",
+        "value": "0x22",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_boot84.h",
+          "line": 2087,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1129",
+        "value": "0x1",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_boot84.h",
+          "line": 2089,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1320",
+        "value": "0xf",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_boot84.h",
+          "line": 2090,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x131b",
+        "value": "0x3",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 364,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x2302",
+        "value": "0x3f",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_boot84.h",
+          "line": 2095,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1f01",
+        "value": "0x0",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_boot84.h",
+          "line": 2096,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1121",
+        "value": "0xa6",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1478,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1316",
+        "value": "0x0",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_boot84.h",
+          "line": 2098,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1317",
+        "value": "0x0",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_boot84.h",
+          "line": 2099,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1318",
+        "value": "0x0",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_boot84.h",
+          "line": 2104,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1319",
+        "value": "0x0",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_boot84.h",
+          "line": 2107,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x131a",
+        "value": "0x0",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_boot84.h",
+          "line": 2108,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x131c",
+        "value": "0x1a",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_boot84.h",
+          "line": 2111,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x131e",
+        "value": "0x0",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_boot84.h",
+          "line": 2113,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x131f",
+        "value": "0x0",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_boot84.h",
+          "line": 2114,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1101",
+        "value": "0xfe",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_boot84.h",
+          "line": 2133,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1b75",
+        "value": "0x9f",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_boot84.h",
+          "line": 2141,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1007",
+        "value": "0x10",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 929,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1009",
+        "value": "0x2",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 931,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x120c",
+        "value": "0x2",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 932,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1502",
+        "value": "0xff",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 933,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1503",
+        "value": "0x9c",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 934,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1504",
+        "value": "0x70",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 935,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1505",
+        "value": "0x2e",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 936,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x151b",
+        "value": "0x3",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 937,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x150a",
+        "value": "0x5d",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 938,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1508",
+        "value": "0x10",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 939,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1501",
+        "value": "0x1",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 940,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1205",
+        "value": "0xff",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 941,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1206",
+        "value": "0x0",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 942,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1201",
+        "value": "0x0",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 945,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1208",
+        "value": "0x0",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 947,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1207",
+        "value": "0x20",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 967,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1501",
+        "value": "0x1",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 940,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1107",
+        "value": "0x1",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 970,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x2505",
+        "value": "0x5",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1054,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x2502",
+        "value": "0x5",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1057,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x2503",
+        "value": "0x8a",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1060,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x2506",
+        "value": "0xca",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1063,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1208",
+        "value": "0x2",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1066,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x2601",
+        "value": "0x4a",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1105,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x2503",
+        "value": "0x8a",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1060,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x120a",
+        "value": "0x0",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1111,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1209",
+        "value": "0x1",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1115,
+          "commented_out": true
+        }
+      },
+      {
+        "register": "0x1f06",
+        "value": "0x2",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1164,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x2001",
+        "value": "0xd",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1167,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x2a04",
+        "value": "0x0",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1169,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x2a07",
+        "value": "0x20",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1170,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x2301",
+        "value": "0x0",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1171,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x2303",
+        "value": "0x0",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1172,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x2a02",
+        "value": "0x2",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1173,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x2a05",
+        "value": "0x2",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1174,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x100b",
+        "value": "0x0",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1177,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x2a01",
+        "value": "0xc",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1194,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x107e",
+        "value": "0x99",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1275,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1b08",
+        "value": "0x30",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1276,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x2102",
+        "value": "0x0",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1277,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x107e",
+        "value": "0x0",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1278,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x2001",
+        "value": "0x1",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1281,
+          "commented_out": true
+        }
+      },
+      {
+        "register": "0x1b73",
+        "value": "0xe0",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_boot84.h",
+          "line": 2445,
+          "commented_out": false
+        }
+      },
+      {
+        "register": "0x1b79",
+        "value": "0xa0",
+        "source": {
+          "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+          "line": 1324,
+          "commented_out": false
+        }
+      }
+    ],
+    "entries_with_uncommented_call_reference": 59,
+    "entries_only_in_commented_call_references": 2,
+    "call_matching": "Both uncommented and commented-out vendor-write calls counted as register-data evidence; each selected reference is explicitly classified. This is not a behavior/equivalence claim."
+  },
+  "license_commit_date": "2024-06-16T16:43:44Z",
+  "license_blob": "31bf790b7eb0b985889e6b9ce854d310ab02d00a",
+  "linux_helper_corroboration": {
+    "repository": "torvalds/linux",
+    "path": "sound/pci/hda/hda_generic.c",
+    "commit": "f155f3b3ed1af23884ffaffe8a669722b87ac9d6",
+    "blob": "bf685d01259d30070aaf3ac7f3ed3204bc30c5bd",
+    "license": "GPL-2.0-or-later",
+    "finding": "Both changed mixer helper blocks occur in this explicitly licensed Linux source; not proof of their historical copying direction."
+  },
+  "license_review_conclusion": "Specific missing-Egorenkov-Apple-source-origin blocker closed for this package on a GPLv2 distribution basis. This is not a new standalone license grant for the entire historical Egorenkov fork.",
+  "gpl2024_source_blobs": [
+    {
+      "path": "patch_cirrus/patch_cirrus_boot84.h",
+      "blob": "4bb1a36965ca006530e4877ab8774812b010c2f3"
+    },
+    {
+      "path": "patch_cirrus/patch_cirrus_apple.h",
+      "blob": "bb8f4f2ab82d7c194452ccf091a62c4a3680c745"
+    },
+    {
+      "path": "patch_cirrus/patch_cirrus_new84.h",
+      "blob": "3216d9a4f1ae1e46d72dbfad129e7ca0b7f7fb26"
+    },
+    {
+      "path": "patch_cirrus/patch_cirrus_real84.h",
+      "blob": "76de5e86d7feb48c81fc1ba6b754212aa8295997"
+    },
+    {
+      "path": "patch_cirrus/patch_cirrus_real84_i2c.h",
+      "blob": "101f27c35ca04e6dfcad766dab0649d88d854e40"
+    }
+  ],
+  "license_commit_author_display_name": "Src User",
+  "license_commit_author_github_login": null,
+  "project_license_action_evidence": "GPLv2 LICENSE added in davidjo repository in response to issue 126; maintainer davidjo participates in that issue. Commit response does not link its Src User author identity to a GitHub account."
+}
